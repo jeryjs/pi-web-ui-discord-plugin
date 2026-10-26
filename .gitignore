@@ -1,0 +1,8 @@
+node_modules/
+storage.json
+secrets.bin
+config.json
+.pi-source.json
+.pi-git-sha
+*.log
+.DS_Store

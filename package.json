@@ -1,0 +1,15 @@
+{
+  "name": "pi-web-ui-discord-plugin",
+  "version": "1.0.0",
+  "description": "Standalone English-first Discord plugin for pi-web-ui",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check index.mjs && node --check client/entry.mjs"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "license": "MIT"
+}
