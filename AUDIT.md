@@ -120,4 +120,13 @@ The release candidate must pass with zero failures. The suite covers command def
 
 ## Live verification record
 
-Live verification against Discord Application `1564275983425609788`, guild `949381557267857469`, and channel `1031955437005848616` is recorded after installation and PM2 restart.
+Live verification was performed on 2026-10-27 against Discord Application `1564275983425609788`, guild `949381557267857469`, and channel `1031955437005848616`.
+
+- Installed the GitHub release as plugin ID `discord` with the existing encrypted `secrets.bin` and plaintext `storage.json` preserved. SHA-256 checksums matched before and after the replacement.
+- PM2 process `11` (`pi-web-ui`) restarted successfully and reported the plugin as version `1.0.1`.
+- The Gateway connected as `@Nero` and registered six commands in the target guild.
+- A live `GET /applications/1564275983425609788/guilds/949381557267857469/commands` returned exactly `/help`, `/status`, `/new`, `/clear`, `/cwd`, and `/model`; both `/cwd.path` and `/model.model` had `autocomplete: true`.
+- A live reply-routing probe dispatched through the installed plugin, bound the returned host conversation ID, posted a reply to channel `1031955437005848616`, left zero pending runs, and had the expected message reference. The temporary verification reply was deleted after inspection.
+- Native `PING`, application-command, and autocomplete callback paths are covered by the automated interaction tests; Discord's REST command definition endpoint confirmed that the live guild registration matches those definitions.
+
+The browser page-picker bridge was not available on this host, so command invocation was verified through the registered live Discord definitions and the plugin's interaction test harness rather than a manually clicked Discord client.

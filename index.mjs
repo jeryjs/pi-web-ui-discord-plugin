@@ -362,6 +362,7 @@ export class DiscordBotBridge {
 		this.userGenerations = new Map();
 		this.knownGuilds = new Set();
 		this.registeredGuilds = new Set();
+		this.commandRegistrations = new Map();
 		this.modelCatalog = [];
 		this.modelCatalogAt = 0;
 		this.activeDispatch = null;
@@ -629,22 +630,36 @@ export class DiscordBotBridge {
 		const applicationId = String(this.applicationId || "").trim();
 		const token = this.getConfig().botToken;
 		if (!id || !applicationId || !token) return false;
+		if (this.registeredGuilds.has(id)) return true;
+		const inFlight = this.commandRegistrations.get(id);
+		if (inFlight) return inFlight;
+
+		const registration = (async () => {
+			try {
+				const registered = await this.api(
+					token,
+					"PUT",
+					`/applications/${applicationId}/guilds/${id}/commands`,
+					DISCORD_COMMANDS,
+				);
+				const count = Array.isArray(registered) ? registered.length : DISCORD_COMMANDS.length;
+				this.status.registeredCommands = count;
+				this.registeredGuilds.add(id);
+				this.log("info", `Registered ${count} native Discord commands in guild ${id}`);
+				return true;
+			} catch (error) {
+				this.status.lastError = error?.message || String(error);
+				this.log("warn", `Discord command registration failed for guild ${id}: ${this.status.lastError}`);
+				return false;
+			}
+		})();
+		this.commandRegistrations.set(id, registration);
 		try {
-			const registered = await this.api(
-				token,
-				"PUT",
-				`/applications/${applicationId}/guilds/${id}/commands`,
-				DISCORD_COMMANDS,
-			);
-			const count = Array.isArray(registered) ? registered.length : DISCORD_COMMANDS.length;
-			this.status.registeredCommands = count;
-			this.registeredGuilds.add(id);
-			this.log("info", `Registered ${count} native Discord commands in guild ${id}`);
-			return true;
-		} catch (error) {
-			this.status.lastError = error?.message || String(error);
-			this.log("warn", `Discord command registration failed for guild ${id}: ${this.status.lastError}`);
-			return false;
+			return await registration;
+		} finally {
+			if (this.commandRegistrations.get(id) === registration) {
+				this.commandRegistrations.delete(id);
+			}
 		}
 	}
 

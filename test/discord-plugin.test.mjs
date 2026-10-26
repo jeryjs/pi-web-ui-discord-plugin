@@ -290,6 +290,8 @@ test("native guild commands are registered with Discord's bulk-overwrite route",
 		"model",
 	]);
 	assert.ok(harness.bridge.registeredGuilds.has("949381557267857469"));
+	await harness.bridge.registerGuildCommands("949381557267857469");
+	assert.equal(harness.apiCalls.filter((call) => call.method === "PUT").length, 1);
 });
 
 test("native interactions answer ping, command, and autocomplete callbacks", async () => {
