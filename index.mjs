@@ -14,6 +14,7 @@ import { chunkMarkdownText } from "./markdown-chunks.mjs";
 export const SECRET_BOT_TOKEN = "discord.botToken";
 
 export const DISCORD_API_BASE = "https://discord.com/api/v10";
+export const PLUGIN_VERSION = "1.0.2";
 
 export const DISCORD_INTENTS = Object.freeze({
 	GUILDS: 1 << 0,
@@ -192,7 +193,7 @@ export async function discordApi(token, method, path, payload = null, { timeoutM
 	const url = `${DISCORD_API_BASE}${path.startsWith("/") ? path : `/${path}`}`;
 	const headers = {
 		Authorization: `Bot ${token}`,
-		"User-Agent": "DiscordBot (pi-web-ui-discord-plugin, 1.0.0)",
+		"User-Agent": `DiscordBot (pi-web-ui-discord-plugin, ${PLUGIN_VERSION})`,
 	};
 	if (payload !== null) headers["Content-Type"] = "application/json; charset=utf-8";
 
@@ -1175,12 +1176,17 @@ export default async function activate(host) {
 	const registerTool = host.registerAgentTool || host.registerTool;
 	const unregisterTool = registerTool?.call(host, discordTool) || null;
 
-	host.onClientMessage?.(async (message, reply) => {
+	const unregisterClientMessage = host.onClientMessage?.(async (message, reply) => {
+		const respond = (payload) =>
+			reply({
+				...(payload || {}),
+				...(message?.requestId ? { requestId: message.requestId } : {}),
+			});
 		try {
 			switch (message?.type) {
 				case "get_state": {
 					const secrets = (await host.secrets?.getAll?.()) || {};
-					reply({
+					respond({
 						type: "state",
 						config: {
 							defaultChannelId: localConfig.defaultChannelId || "",
@@ -1215,7 +1221,7 @@ export default async function activate(host) {
 					} else {
 						await bridge.stop().catch(() => {});
 					}
-					reply({ type: "save_config_done", success: true, botStatus: bridge.getStatus() });
+					respond({ type: "save_config_done", success: true, botStatus: bridge.getStatus() });
 					break;
 				}
 
@@ -1224,18 +1230,18 @@ export default async function activate(host) {
 					const secrets = (await host.secrets?.getAll?.()) || {};
 					const testConfig = mergeSavedSecrets(incoming, localConfig, secrets);
 					if (!testConfig.botToken) {
-						reply({ type: "test_config_done", success: false, message: "Bot Token is not configured." });
+						respond({ type: "test_config_done", success: false, message: "Bot Token is not configured." });
 						break;
 					}
 					try {
 						const bot = await discordApi(testConfig.botToken, "GET", "/users/@me", null, { timeoutMs: 10_000 });
-						reply({
+						respond({
 							type: "test_config_done",
 							success: true,
 							message: `Connection successful: @${bot.username} (ID: ${bot.id})`,
 						});
 					} catch (error) {
-						reply({
+						respond({
 							type: "test_config_done",
 							success: false,
 							message: `Connection failed: ${error?.message || error}`,
@@ -1254,7 +1260,7 @@ export default async function activate(host) {
 						`/channels/${channelId}/messages`,
 						{ content: String(message.text || "") },
 					);
-					reply({ type: "send_done", success: true, result });
+					respond({ type: "send_done", success: true, result });
 					break;
 				}
 
@@ -1263,7 +1269,7 @@ export default async function activate(host) {
 					localConfig.botEnabled = true;
 					await host.storage.set("config", stripSecretsFromConfig(localConfig));
 					await bridge.start();
-					reply({ type: "bot_status", success: true, status: bridge.getStatus() });
+					respond({ type: "bot_status", success: true, status: bridge.getStatus() });
 					break;
 				}
 
@@ -1271,20 +1277,21 @@ export default async function activate(host) {
 					localConfig.botEnabled = false;
 					await host.storage.set("config", stripSecretsFromConfig(localConfig));
 					await bridge.stop();
-					reply({ type: "bot_status", success: true, status: bridge.getStatus() });
+					respond({ type: "bot_status", success: true, status: bridge.getStatus() });
 					break;
 				}
 
 				default:
-					reply({ type: "error", message: `Unknown message type: ${message?.type}` });
+					respond({ type: "error", message: `Unknown message type: ${message?.type}` });
 					break;
 			}
 		} catch (error) {
-			reply({ type: "error", message: error?.message || String(error) });
+			respond({ type: "error", message: error?.message || String(error) });
 		}
 	});
 
 	return async () => {
+		unregisterClientMessage?.();
 		await bridge.stop().catch(() => {});
 		try {
 			unregisterTool?.();

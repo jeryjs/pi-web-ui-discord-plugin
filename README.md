@@ -53,13 +53,9 @@ Install directly from GitHub:
 pi-web-ui install jeryjs/pi-web-ui-discord-plugin --name discord --force --data-dir ~/.pi-web
 ```
 
-Then restart pi-web-ui if it is already running:
-
-```bash
-pm2 restart pi-web-ui
-```
-
 The pi-web-ui installer preserves `storage.json`, `secrets.bin`, `config.json`, and runtime dependencies when replacing an existing plugin. Existing settings therefore survive an in-place update.
+
+A running pi-web-ui service does **not** need to be restarted. After the CLI installation, open **Settings → UI plugins** and click **Rescan**, or refresh the browser so pi-web-ui reloads the plugin catalog. pi-web-ui 0.112.0 does not expose a separate `pi-web-ui plugins reload` subcommand; **Rescan** is the host's supported no-restart plugin reload action.
 
 To install under a different plugin ID, omit `--name discord`. The Discord bot panel remains available under the **Discord** view.
 
@@ -118,6 +114,7 @@ The test suite covers:
 - Discord interaction callbacks and autocomplete
 - allowlist enforcement
 - configuration and secret merging
+- UI request/response correlation and hot-reload cleanup
 - Markdown chunking
 
 See [`AUDIT.md`](./AUDIT.md) for the defect audit and release verification record.

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import {
+import activate, {
 	DISCORD_COMMANDS,
 	DISCORD_GATEWAY_INTENTS,
 	INTERACTION_RESPONSE_TYPE,
@@ -369,8 +369,56 @@ test("directory autocomplete filters directories under the current workspace", a
 	}
 });
 
+test("activation correlates UI replies and unregisters the client handler on cleanup", async () => {
+	let clientMessageHandler = null;
+	let clientHandlerCount = 0;
+	let clientHandlerCleanupCount = 0;
+	let toolCleanupCount = 0;
+	const replies = [];
+	const host = {
+		cwd: "/home/jery",
+		models: { list: () => [] },
+		storage: {
+			get: async (key) => key === "config"
+				? { botToken: "test-token", botEnabled: false, allowedUsers: [AUTHOR_ID] }
+				: {},
+			set: async () => {},
+		},
+		secrets: {
+			getAll: async () => ({}),
+			get: async () => "",
+			set: async () => {},
+			delete: async () => {},
+		},
+		registerAgentTool: () => () => { toolCleanupCount += 1; },
+		onClientMessage: (handler) => {
+			clientMessageHandler = handler;
+			clientHandlerCount += 1;
+			return () => {
+				clientHandlerCleanupCount += 1;
+				clientMessageHandler = null;
+			};
+		},
+		onRunEvent: () => () => {},
+		chat: async () => ({ conversationId: "c1" }),
+		log: () => {},
+	};
+
+	const cleanup = await activate(host);
+	assert.equal(clientHandlerCount, 1);
+	assert.ok(clientMessageHandler);
+	await clientMessageHandler({ type: "get_state", requestId: "request-1" }, (reply) => replies.push(reply));
+	assert.equal(replies.at(-1).type, "state");
+	assert.equal(replies.at(-1).requestId, "request-1");
+
+	await cleanup();
+	assert.equal(clientHandlerCleanupCount, 1);
+	assert.equal(toolCleanupCount, 1);
+	assert.equal(clientMessageHandler, null);
+});
+
 test("all user-facing plugin files are English-first", async () => {
-	for (const file of ["index.mjs", "client/entry.mjs", "manifest.json", "README.md"]) {
+	for (const file of ["index.mjs", "client/entry.mjs", "client/host-bridge.mjs", "manifest.json", "README.md"]) {
 		const content = await readFile(new URL(`../${file}`, import.meta.url), "utf8");
 		assert.equal(/[\u3400-\u9fff]/u.test(content), false, `${file} contains CJK text`);
 	}

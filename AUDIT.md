@@ -107,6 +107,8 @@ The old plugin only listened for `MESSAGE_CREATE`. Discord application-command i
 - Apply a 10-minute run timeout and a guarded Discord reply limit.
 - Restrict `/cwd` autocomplete to descendants of the current workspace.
 - Keep the bot token out of plaintext storage and out of the repository.
+- Correlate dashboard requests with unique request IDs so Save, Test, and Send wait for the actual server response instead of an undefined fire-and-forget result.
+- Unregister the dashboard message handler during plugin cleanup so hot reloads cannot leave duplicate handlers behind.
 
 ## Automated verification
 
@@ -123,10 +125,18 @@ The release candidate must pass with zero failures. The suite covers command def
 Live verification was performed on 2026-10-27 against Discord Application `1564275983425609788`, guild `949381557267857469`, and channel `1031955437005848616`.
 
 - Installed the GitHub release as plugin ID `discord` with the existing encrypted `secrets.bin` and plaintext `storage.json` preserved. SHA-256 checksums matched before and after the replacement.
-- PM2 process `11` (`pi-web-ui`) restarted successfully and reported the plugin as version `1.0.1`.
+- PM2 process `11` (`pi-web-ui`) remained online while version `1.0.2` was installed with the `pi-web-ui install` CLI and hot-reloaded through the host's `plugins_reload` path; the PID and PM2 restart count did not change.
 - The Gateway connected as `@Nero` and registered six commands in the target guild.
 - A live `GET /applications/1564275983425609788/guilds/949381557267857469/commands` returned exactly `/help`, `/status`, `/new`, `/clear`, `/cwd`, and `/model`; both `/cwd.path` and `/model.model` had `autocomplete: true`.
 - A live reply-routing probe dispatched through the installed plugin, bound the returned host conversation ID, posted a reply to channel `1031955437005848616`, left zero pending runs, and had the expected message reference. The temporary verification reply was deleted after inspection.
 - Native `PING`, application-command, and autocomplete callback paths are covered by the automated interaction tests; Discord's REST command definition endpoint confirmed that the live guild registration matches those definitions.
 
 The browser page-picker bridge was not available on this host, so command invocation was verified through the registered live Discord definitions and the plugin's interaction test harness rather than a manually clicked Discord client.
+
+### 6. Dashboard actions reported an unknown error
+
+**Fix**
+
+- pi-web-ui's client `context.send()` is fire-and-forget; it does not return the plugin's response. The dashboard previously treated its return value as a response, so successful actions such as **Save configuration** displayed `Unknown error` even when the server had persisted the values.
+- Add request IDs, response correlation, timeouts, and explicit cleanup in `client/host-bridge.mjs`.
+- Return the correlated server response for every dashboard action and surface server-provided error messages.

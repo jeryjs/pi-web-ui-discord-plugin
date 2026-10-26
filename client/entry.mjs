@@ -1,8 +1,11 @@
 /** English-first Discord bot dashboard for pi-web-ui. */
 
+import { createHostRequestBridge } from "./host-bridge.mjs";
+
 export default {
 	async mount(element, context) {
-		const sendHost = async (type, payload = {}) => context.send({ type, ...payload });
+		const hostBridge = createHostRequestBridge(context);
+		const sendHost = (type, payload = {}) => hostBridge.send(type, payload);
 
 		element.innerHTML = `
 			<div class="discord-root" style="display: flex; flex-direction: column; height: 100%; box-sizing: border-box; background: var(--bg); color: var(--text); font-size: 13px;">
@@ -315,5 +318,6 @@ export default {
 		});
 
 		await refresh();
+		return () => hostBridge.dispose();
 	},
 };
