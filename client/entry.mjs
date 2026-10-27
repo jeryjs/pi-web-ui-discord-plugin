@@ -43,11 +43,22 @@ export default {
 							</div>
 						</div>
 						<div class="discord-metric-commands" style="margin-top: 10px; font-size: 12px; color: var(--text-dim); line-height: 1.5;">
-							Native guild commands: <code>/help</code>, <code>/status</code>, <code>/new</code>, <code>/clear</code>, <code>/cancel</code>, <code>/cwd</code>, <code>/model</code>, <code>/thinking</code>, and <code>/system</code>. The <code>/cwd</code> and <code>/model</code> options support autocomplete.
+							Native commands: <code>/help</code>, <code>/status</code>, <code>/new</code>, <code>/clear</code>, <code>/cancel</code>, <code>/cwd</code>, <code>/model</code>, <code>/thinking</code>, and <code>/system</code>. The <code>/cwd</code> and <code>/model</code> options support autocomplete. Commands are registered globally and per guild, so they also work in DMs when the app is installed to a user account.
 						</div>
 						<div class="discord-metric-detail" style="margin-top: 6px; font-size: 12px; color: var(--text-dim); line-height: 1.5;"></div>
 						<div style="margin-top: 8px; font-size: 12px; color: var(--text-dim); line-height: 1.5;">
 							The bot uses Discord's outbound Gateway WebSocket, so no public IP or reverse proxy is required. Each Discord user gets an isolated, persistent pi-web-ui conversation.
+						</div>
+					</div>
+
+					<div style="border: 1px solid var(--border); border-radius: 6px; padding: 16px; background: var(--bg-elev);">
+						<div style="font-weight: 600; font-size: 14px; margin-bottom: 8px;">👤 Install to a user account</div>
+						<div class="discord-user-install-detail" style="font-size: 12px; color: var(--text-dim); line-height: 1.5; margin-bottom: 10px;">
+							Global commands: <span class="discord-metric-global">unknown</span>. Users who add the app to their own account can use it in every server, DM, and group chat they have.
+						</div>
+						<div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+							<input type="text" class="discord-user-install-url" readonly style="flex: 1; min-width: 220px; box-sizing: border-box; padding: 6px 10px; border-radius: 4px; border: 1px solid var(--border); background: var(--bg); color: var(--text-dim); font-size: 11px; outline: none;" />
+							<button type="button" class="discord-btn-copy-user-install" style="padding: 6px 12px; border-radius: 4px; border: 1px solid var(--border); background: var(--bg-elev2); color: var(--text); cursor: pointer; font-size: 12px;">Copy install link</button>
 						</div>
 					</div>
 
@@ -163,6 +174,8 @@ export default {
 		const metricReceived = query(".discord-metric-recv");
 		const metricSent = query(".discord-metric-sent");
 		const modal = query(".discord-modal-settings");
+		const metricGlobal = query(".discord-metric-global");
+		const userInstallUrl = query(".discord-user-install-url");
 
 		const configToken = query(".discord-cfg-token");
 		const configDefaultChannel = query(".discord-cfg-default-channel");
@@ -210,6 +223,15 @@ export default {
 			metricUsername.textContent = bot.botUsername ? `@${bot.botUsername}` : "--";
 			metricReceived.textContent = String(bot.messagesReceived || 0);
 			metricSent.textContent = String(bot.messagesReplied || 0);
+			if (metricGlobal) {
+				metricGlobal.textContent = bot.registeredGlobally ? "registered" : "not registered";
+			}
+			if (userInstallUrl) {
+				const applicationId = String(bot.applicationId || "").trim();
+				userInstallUrl.value = applicationId
+					? `https://discord.com/oauth2/authorize?client_id=${applicationId}&integration_type=1&scope=applications.commands`
+					: "Connect the bot to generate a user-install link.";
+			}
 		}
 
 		async function refresh() {
@@ -364,6 +386,29 @@ export default {
 			const running = currentState.botStatus?.state === "connected";
 			await sendHost(running ? "stop_bot" : "start_bot");
 			await refresh();
+		});
+
+		query(".discord-btn-copy-user-install")?.addEventListener("click", async () => {
+			const button = query(".discord-btn-copy-user-install");
+			const url = String(userInstallUrl?.value || "").trim();
+			if (!url || !url.startsWith("http")) {
+				globalThis.alert?.("Connect the bot first to generate a user-install link.");
+				return;
+			}
+			try {
+				await globalThis.navigator?.clipboard?.writeText(url);
+				if (button) button.textContent = "✓ Copied";
+			} catch {
+				if (userInstallUrl) {
+					userInstallUrl.removeAttribute("readonly");
+					userInstallUrl.select();
+				}
+			}
+			if (button) {
+				setTimeout(() => {
+					button.textContent = "Copy install link";
+				}, 1500);
+			}
 		});
 
 		query(".discord-btn-send").addEventListener("click", async () => {

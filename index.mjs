@@ -14,7 +14,7 @@ import { chunkMarkdownText } from "./markdown-chunks.mjs";
 export const SECRET_BOT_TOKEN = "discord.botToken";
 
 export const DISCORD_API_BASE = "https://discord.com/api/v10";
-export const PLUGIN_VERSION = "1.1.1";
+export const PLUGIN_VERSION = "1.2.0";
 
 export const DISCORD_INTENTS = Object.freeze({
 	GUILDS: 1 << 0,
@@ -35,6 +35,12 @@ export const INTERACTION_TYPE = Object.freeze({
 	MESSAGE_COMPONENT: 3,
 	APPLICATION_COMMAND_AUTOCOMPLETE: 4,
 	MODAL_SUBMIT: 5,
+});
+
+export const INTERACTION_CONTEXT = Object.freeze({
+	GUILD: 0,
+	BOT_DM: 1,
+	PRIVATE_CHANNEL: 2,
 });
 
 export const INTERACTION_RESPONSE_TYPE = Object.freeze({
@@ -140,6 +146,22 @@ export const DISCORD_COMMANDS = Object.freeze([
 		]),
 	}),
 ]);
+
+/**
+ * Installation contexts supported by every native command.
+ *
+ * Discord defaults application commands to GUILD_INSTALL (0) only, so user-installed
+ * apps need both contexts declared explicitly to expose commands in DMs.
+ */
+export const DISCORD_COMMAND_INTEGRATION_TYPES = Object.freeze([0, 1]);
+
+/** Build the command payload sent to the Discord application command endpoints. */
+export function buildCommandPayload() {
+	return DISCORD_COMMANDS.map((command) => ({
+		...command,
+		integration_types: [...DISCORD_COMMAND_INTEGRATION_TYPES],
+	}));
+}
 
 const LEGACY_COMMAND_ALIASES = Object.freeze({
 	workspace: "cwd",
@@ -567,6 +589,7 @@ export class DiscordBotBridge {
 		this.userGenerations = new Map();
 		this.knownGuilds = new Set();
 		this.registeredGuilds = new Set();
+		this.registeredGlobally = false;
 		this.commandRegistrations = new Map();
 		this.modelCatalog = [];
 		this.modelCatalogAt = 0;
@@ -587,6 +610,7 @@ export class DiscordBotBridge {
 			lastError: null,
 			registeredGuilds: [],
 			registeredCommands: DISCORD_COMMANDS.length,
+			registeredGlobally: false,
 		};
 	}
 
@@ -828,6 +852,7 @@ export class DiscordBotBridge {
 			}
 		}
 
+		await this.registerGlobalCommands();
 		await this.registerKnownGuildCommands();
 	}
 
@@ -852,7 +877,7 @@ export class DiscordBotBridge {
 					token,
 					"PUT",
 					`/applications/${applicationId}/guilds/${id}/commands`,
-					DISCORD_COMMANDS,
+					buildCommandPayload(),
 				);
 				const count = Array.isArray(registered) ? registered.length : DISCORD_COMMANDS.length;
 				this.status.registeredCommands = count;
@@ -872,6 +897,32 @@ export class DiscordBotBridge {
 			if (this.commandRegistrations.get(id) === registration) {
 				this.commandRegistrations.delete(id);
 			}
+		}
+	}
+
+	async registerGlobalCommands() {
+		const applicationId = String(this.applicationId || "").trim();
+		const token = this.getConfig().botToken;
+		if (!applicationId || !token) return false;
+		if (this.registeredGlobally) return true;
+
+		try {
+			const registered = await this.api(
+				token,
+				"PUT",
+				`/applications/${applicationId}/commands`,
+				buildCommandPayload(),
+			);
+			const count = Array.isArray(registered) ? registered.length : DISCORD_COMMANDS.length;
+			this.status.registeredCommands = count;
+			this.registeredGlobally = true;
+			this.status.registeredGlobally = true;
+			this.log("info", `Registered ${count} global native Discord commands`);
+			return true;
+		} catch (error) {
+			this.status.lastError = error?.message || String(error);
+			this.log("warn", `Discord global command registration failed: ${this.status.lastError}`);
+			return false;
 		}
 	}
 
@@ -900,10 +951,16 @@ export class DiscordBotBridge {
 		);
 	}
 
+	/** Omit the ephemeral flag for DM/private-channel interactions so user-installed-app responses are visible there. */
+	interactionFlags(interaction) {
+		const context = Number(interaction?.context ?? 0);
+		return context === INTERACTION_CONTEXT.GUILD ? DISCORD_EPHEMERAL_FLAG : undefined;
+	}
+
 	async deferInteraction(interaction) {
 		await this.respondToInteraction(interaction, {
 			type: INTERACTION_RESPONSE_TYPE.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE,
-			data: { flags: DISCORD_EPHEMERAL_FLAG },
+			data: { ...(this.interactionFlags(interaction) !== undefined ? { flags: this.interactionFlags(interaction) } : {}) },
 		});
 	}
 
@@ -914,7 +971,7 @@ export class DiscordBotBridge {
 			this.getConfig().botToken,
 			"PATCH",
 			`/webhooks/${applicationId}/${interaction.token}/messages/@original`,
-			{ content, flags: DISCORD_EPHEMERAL_FLAG },
+			{ content, ...(this.interactionFlags(interaction) !== undefined ? { flags: this.interactionFlags(interaction) } : {}) },
 		);
 	}
 
@@ -926,7 +983,7 @@ export class DiscordBotBridge {
 				type: INTERACTION_RESPONSE_TYPE.CHANNEL_MESSAGE_WITH_SOURCE,
 				data: {
 					content: "Access denied. Add your Discord User ID to the bot allowlist in pi-web-ui.",
-					flags: DISCORD_EPHEMERAL_FLAG,
+					...(this.interactionFlags(interaction) !== undefined ? { flags: this.interactionFlags(interaction) } : {}),
 				},
 			});
 			return;
@@ -959,7 +1016,7 @@ export class DiscordBotBridge {
 			else {
 				await this.respondToInteraction(interaction, {
 					type: INTERACTION_RESPONSE_TYPE.CHANNEL_MESSAGE_WITH_SOURCE,
-					data: { content: finalContent, flags: DISCORD_EPHEMERAL_FLAG },
+					data: { content: finalContent, ...(this.interactionFlags(interaction) !== undefined ? { flags: this.interactionFlags(interaction) } : {}) },
 				});
 			}
 		} catch (error) {
@@ -969,7 +1026,7 @@ export class DiscordBotBridge {
 			} else {
 				await this.respondToInteraction(interaction, {
 					type: INTERACTION_RESPONSE_TYPE.CHANNEL_MESSAGE_WITH_SOURCE,
-					data: { content: finalContent, flags: DISCORD_EPHEMERAL_FLAG },
+					data: { content: finalContent, ...(this.interactionFlags(interaction) !== undefined ? { flags: this.interactionFlags(interaction) } : {}) },
 				}).catch(() => {});
 			}
 		}
@@ -1039,7 +1096,9 @@ export class DiscordBotBridge {
 				"- `/system replace <text>` — replace the core system prompt.",
 				"- `/system append <text>` — append to the core system prompt.",
 				"",
-				"Native slash commands are registered per guild. Plain-text commands remain supported.",
+				"Native slash commands are registered globally and per guild.",
+				"Installing this app to your own account lets you use it in your servers, DMs, and group chats.",
+				"Plain-text commands remain supported.",
 				"Messages in channels configured for automatic replies reach the bot without an @mention,",
 				"and replying to a message adds that message as context.",
 			].join("\n");
@@ -1057,6 +1116,8 @@ export class DiscordBotBridge {
 				`- Application ID: ${status.applicationId || "unknown"}`,
 				`- Native commands registered: ${status.registeredCommands}`,
 				`- Guilds with registered commands: ${guilds}`,
+				`- Global commands registered: ${this.status.registeredGlobally ? "yes" : "no"}`,
+				`- User install: https://discord.com/oauth2/authorize?client_id=${this.applicationId || "CLIENT_ID"}&integration_type=1&scope=applications.commands`,
 				`- Messages received: ${status.messagesReceived}`,
 				`- Replies sent: ${status.messagesReplied}`,
 				`- Workspace: ${this.resolveWorkspace(authorId, config) || "(host default)"}`,

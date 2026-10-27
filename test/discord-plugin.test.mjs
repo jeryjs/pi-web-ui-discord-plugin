@@ -288,7 +288,9 @@ test("native guild commands are registered with Discord's bulk-overwrite route",
 		application: { id: "1564275983425609788" },
 		guilds: [{ id: "949381557267857469" }],
 	});
-	const registration = harness.apiCalls.find((call) => call.method === "PUT");
+	const registration = harness.apiCalls.find(
+		(call) => call.method === "PUT" && call.path.includes("/guilds/949381557267857469/commands"),
+	);
 	assert.ok(registration);
 	assert.equal(
 		registration.path,
@@ -307,7 +309,78 @@ test("native guild commands are registered with Discord's bulk-overwrite route",
 	]);
 	assert.ok(harness.bridge.registeredGuilds.has("949381557267857469"));
 	await harness.bridge.registerGuildCommands("949381557267857469");
-	assert.equal(harness.apiCalls.filter((call) => call.method === "PUT").length, 1);
+	assert.equal(
+		harness.apiCalls.filter(
+			(call) => call.method === "PUT" && call.path.includes("/guilds/949381557267857469/commands"),
+		).length,
+		1,
+	);
+});
+
+test("global commands are registered so user-installed apps can use them in DMs", async () => {
+	const harness = createHarness();
+	await harness.bridge.handleReady({
+		user: { id: BOT_ID, username: "Nero" },
+		application: { id: "1564275983425609788" },
+		guilds: [{ id: "949381557267857469" }],
+	});
+
+	const global = harness.apiCalls.find(
+		(call) => call.method === "PUT" && call.path === "/applications/1564275983425609788/commands",
+	);
+	assert.ok(global);
+	assert.deepEqual(global.payload.map((command) => command.name), [
+		"help",
+		"status",
+		"new",
+		"clear",
+		"cancel",
+		"cwd",
+		"model",
+		"thinking",
+		"system",
+	]);
+	for (const command of global.payload) {
+		assert.deepEqual(command.integration_types, [0, 1]);
+	}
+	assert.equal(harness.bridge.status.registeredGlobally, true);
+
+	await harness.bridge.registerGlobalCommands();
+	assert.equal(
+		harness.apiCalls.filter(
+			(call) => call.method === "PUT" && call.path === "/applications/1564275983425609788/commands",
+		).length,
+		1,
+	);
+});
+
+test("command responses stay ephemeral in guilds but visible in DMs", async () => {
+	const harness = createHarness({ models: [{ id: "openai/gpt-5" }] });
+
+	await harness.bridge.handleInteraction({
+		id: "guild-interaction",
+		token: "interaction-token",
+		type: INTERACTION_TYPE.APPLICATION_COMMAND,
+		member: { user: { id: AUTHOR_ID } },
+		guild_id: "949381557267857469",
+		context: 0,
+		data: { name: "help", options: [] },
+	});
+	const guildResponse = harness.apiCalls.at(-1);
+	assert.equal(guildResponse.path, "/interactions/guild-interaction/interaction-token/callback");
+	assert.equal(guildResponse.payload.data.flags, 64);
+
+	await harness.bridge.handleInteraction({
+		id: "dm-interaction",
+		token: "interaction-token",
+		type: INTERACTION_TYPE.APPLICATION_COMMAND,
+		user: { id: AUTHOR_ID },
+		context: 1,
+		data: { name: "help", options: [] },
+	});
+	const dmResponse = harness.apiCalls.at(-1);
+	assert.equal(dmResponse.path, "/interactions/dm-interaction/interaction-token/callback");
+	assert.equal(dmResponse.payload.data.flags, undefined);
 });
 
 test("native interactions answer ping, command, and autocomplete callbacks", async () => {
