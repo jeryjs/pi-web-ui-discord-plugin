@@ -471,6 +471,52 @@ test("directory autocomplete filters directories under the current workspace", a
 	}
 });
 
+test("the discord agent tool accepts pi-web-ui's execute(toolCallId, params) convention", async () => {
+	let registeredTool = null;
+	const host = {
+		cwd: "/home/jery",
+		models: { list: () => [] },
+		storage: {
+			get: async (key) => (key === "config"
+				? { botToken: "test-token", botEnabled: false, allowedUsers: [AUTHOR_ID], defaultChannelId: CHANNEL_ID }
+				: {}),
+			set: async () => {},
+		},
+		secrets: {
+			getAll: async () => ({}),
+			get: async () => "",
+			set: async () => {},
+			delete: async () => {},
+		},
+		registerAgentTool: (tool) => {
+			registeredTool = tool;
+			return () => {};
+		},
+		onClientMessage: () => () => {},
+		onRunEvent: () => () => {},
+		chat: async () => ({ conversationId: "c1" }),
+		log: () => {},
+	};
+
+	const cleanup = await activate(host);
+	assert.ok(registeredTool);
+
+	// pi-web-ui calls agent tools as execute(toolCallId, params, signal, onUpdate).
+	const status = JSON.parse(await registeredTool.execute("call-1", { action: "status" }));
+	assert.equal(typeof status.state, "string");
+
+	// The legacy single-argument form must keep working too.
+	const legacy = JSON.parse(await registeredTool.execute({ action: "status" }));
+	assert.equal(legacy.state, status.state);
+
+	await assert.rejects(
+		() => registeredTool.execute("call-2", { action: "nope" }),
+		/Unknown Discord tool action: nope/,
+	);
+
+	await cleanup();
+});
+
 test("activation correlates UI replies and unregisters the client handler on cleanup", async () => {
 	let clientMessageHandler = null;
 	let clientHandlerCount = 0;

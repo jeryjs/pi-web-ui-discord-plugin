@@ -14,7 +14,7 @@ import { chunkMarkdownText } from "./markdown-chunks.mjs";
 export const SECRET_BOT_TOKEN = "discord.botToken";
 
 export const DISCORD_API_BASE = "https://discord.com/api/v10";
-export const PLUGIN_VERSION = "1.2.1";
+export const PLUGIN_VERSION = "1.2.2";
 
 export const DISCORD_INTENTS = Object.freeze({
 	GUILDS: 1 << 0,
@@ -1770,17 +1770,28 @@ export default async function activate(host) {
 			},
 			required: ["action"],
 		},
-		async execute(args) {
-			const action = String(args?.action || "");
+		/**
+		 * pi-web-ui invokes agent tools as `execute(toolCallId, params, signal, onUpdate)`,
+		 * so the parameter object arrives as the second argument. Accept the legacy
+		 * single-argument form too, so a direct `execute(params)` call still works.
+		 */
+		async execute(toolCallId, params) {
+			const args =
+				params && typeof params === "object"
+					? params
+					: toolCallId && typeof toolCallId === "object"
+						? toolCallId
+						: {};
+			const action = String(args.action || "");
 			if (action === "send") {
-				const channelId = String(args?.channel_id || "").trim() || String(localConfig.defaultChannelId || "").trim();
+				const channelId = String(args.channel_id || "").trim() || String(localConfig.defaultChannelId || "").trim();
 				if (!channelId) throw new Error("channel_id is required.");
 				if (!localConfig.botToken) throw new Error("Discord Bot Token is not configured.");
 				const result = await discordApi(
 					localConfig.botToken,
 					"POST",
 					`/channels/${channelId}/messages`,
-					{ content: String(args?.text || "") },
+					{ content: String(args.text || "") },
 				);
 				return JSON.stringify(result, null, 2);
 			}
