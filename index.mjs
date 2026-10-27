@@ -14,7 +14,7 @@ import { chunkMarkdownText } from "./markdown-chunks.mjs";
 export const SECRET_BOT_TOKEN = "discord.botToken";
 
 export const DISCORD_API_BASE = "https://discord.com/api/v10";
-export const PLUGIN_VERSION = "1.1.0";
+export const PLUGIN_VERSION = "1.1.1";
 
 export const DISCORD_INTENTS = Object.freeze({
 	GUILDS: 1 << 0,
@@ -147,6 +147,10 @@ const LEGACY_COMMAND_ALIASES = Object.freeze({
 
 const DEFAULT_RUN_TIMEOUT_MS = 10 * 60 * 1000;
 const LATE_TEXT_GRACE_MS = 1_500;
+/** Clock skew tolerated between the host run-event clock and the plugin clock. */
+const EVENT_CLOCK_SKEW_MS = 2_000;
+/** Quiet period before a shared conversation is treated as "our turn is over". */
+const SHARED_RUN_SETTLE_MS = 2_500;
 const MODEL_CACHE_MS = 30_000;
 const AUTOCOMPLETE_TIMEOUT_MS = 2_000;
 
@@ -695,8 +699,14 @@ export class DiscordBotBridge {
 			this.status.lastError = error?.message || "Discord Gateway error";
 			this.log("warn", `Discord Gateway error: ${this.status.lastError}`);
 		};
-		ws.onclose = () => {
+		ws.onclose = (closeEvent) => {
+			const closeCode = Number(closeEvent?.code ?? 0);
+			const closeReason = String(closeEvent?.reason || "").trim();
 			this.status.connected = false;
+			this.log(
+				"warn",
+				`Discord Gateway closed (code=${closeCode}${closeReason ? `, reason=${closeReason}` : ""})`,
+			);
 			if (this.heartbeatTimer) {
 				clearInterval(this.heartbeatTimer);
 				this.heartbeatTimer = null;
@@ -757,6 +767,7 @@ export class DiscordBotBridge {
 		}
 
 		if (op === 9) {
+			this.log("warn", `Discord Gateway invalid session (payload=${JSON.stringify(d ?? null)})`);
 			try {
 				this.ws?.close();
 			} catch {}
@@ -1277,6 +1288,14 @@ export class DiscordBotBridge {
 			replyToMessageId: message.id,
 			accumulatedText: "",
 			startedAt: Date.now(),
+			dispatchedAt: 0,
+			clientId: "",
+			requestText: "",
+			sharedConversation: false,
+			sawUserMessage: false,
+			sawTurnStart: false,
+			turnOpened: false,
+			settleTimer: null,
 			generation,
 			cancelled: false,
 			finished: false,
@@ -1338,9 +1357,14 @@ export class DiscordBotBridge {
 		}, DEFAULT_RUN_TIMEOUT_MS);
 		run.timeoutTimer.unref?.();
 
+		run.dispatchedAt = Date.now();
+		run.requestText = String(request.text || "");
+		run.sharedConversation = Boolean(request.conversationId);
+
 		try {
 			const dispatched = await this.host.chat(request);
 			const conversationId = String(dispatched?.conversationId || "").trim();
+			run.clientId = String(dispatched?.clientId || "").trim();
 			const expectedClientId = `plugin:discord:${request.accountId}`;
 			if (
 				!request.conversationId &&
@@ -1359,7 +1383,10 @@ export class DiscordBotBridge {
 
 			const early = this.earlyRuns.get(conversationId);
 			if (early?.accumulatedText && !run.accumulatedText) {
-				run.accumulatedText = early.accumulatedText;
+				const earlyAt = Number(early.firstAt || 0);
+				const stale =
+					earlyAt > 0 && run.dispatchedAt > 0 && earlyAt < run.dispatchedAt - EVENT_CLOCK_SKEW_MS;
+				if (!stale) run.accumulatedText = early.accumulatedText;
 			}
 			this.earlyRuns.delete(conversationId);
 
@@ -1384,24 +1411,41 @@ export class DiscordBotBridge {
 	async handleRunEvent(event) {
 		const conversationId = String(event?.conversationId || "").trim();
 		if (!conversationId) return;
+		const eventAt = Number(event?.at || 0);
+
+		if (event.type === "run_start") {
+			const run = this.findRun(conversationId);
+			if (run && !this.isStaleRunEvent(run, eventAt)) this.openRunTurn(run);
+			return;
+		}
 
 		if (event.type === "message" && event.message) {
-			const isAssistant = event.message.role === "assistant" || event.message.author === "assistant";
-			if (!isAssistant) return;
+			const role = String(event.message.role || event.message.author || "").trim();
+			let run = this.findRun(conversationId);
+			// Shared conversations also carry the browser's own turns: ignore
+			// events emitted before this Discord turn was dispatched.
+			if (run && this.isStaleRunEvent(run, eventAt)) return;
+
+			if (role === "user") {
+				const text = extractAssistantContent(event.message);
+				if (run && text && run.requestText && text.includes(run.requestText.trim())) {
+					this.openRunTurn(run);
+				}
+				return;
+			}
+			if (role !== "assistant") return;
+
 			const errorMessage = String(event.message.errorMessage || "").trim();
 			if (errorMessage) this.noteRunError(conversationId, errorMessage);
 			const content = extractAssistantContent(event.message);
 			if (!content) return;
 
-			let run = this.pendingRuns.get(conversationId);
-			if (!run && this.activeDispatch?.run && !this.activeDispatch.run.finished) {
-				run = this.activeDispatch.run;
-				this.activeDispatch.earlyConversationId = conversationId;
-			}
 			if (run) {
 				run.accumulatedText += `${run.accumulatedText ? "\n" : ""}${content}`;
+				this.clearRunSettle(run);
 			} else {
-				const early = this.earlyRuns.get(conversationId) || { accumulatedText: "" };
+				const early = this.earlyRuns.get(conversationId) || { accumulatedText: "", firstAt: 0 };
+				if (!early.firstAt) early.firstAt = eventAt;
 				early.accumulatedText += `${early.accumulatedText ? "\n" : ""}${content}`;
 				this.earlyRuns.set(conversationId, early);
 			}
@@ -1409,24 +1453,76 @@ export class DiscordBotBridge {
 		}
 
 		if (event.type !== "run_end") return;
-		let run = this.pendingRuns.get(conversationId);
-		if (!run && this.activeDispatch?.run && !this.activeDispatch.run.finished) {
-			run = this.activeDispatch.run;
-			this.activeDispatch.earlyConversationId = conversationId;
-		}
+		let run = this.findRun(conversationId);
 		if (!run) {
 			this.earlyRuns.delete(conversationId);
 			this.runErrors.delete(conversationId);
 			return;
 		}
+		if (this.isStaleRunEvent(run, eventAt)) return;
 		run.stopReason = String(event?.stopReason || run.stopReason || "");
+		// Our turn ended without text: give the transcript a moment, then report.
+		if (run.sharedConversation && !run.accumulatedText) {
+			this.scheduleRunSettle(run);
+			return;
+		}
 		await this.finishRun(run);
+	}
+
+	/**
+	 * Mark the start of the turn this Discord message triggered.
+	 *
+	 * A shared conversation also runs the browser tab's turns, so the output
+	 * collected before our own turn began is dropped.
+	 */
+	openRunTurn(run) {
+		if (!run || run.turnOpened) return;
+		run.turnOpened = true;
+		run.sawTurnStart = true;
+		run.accumulatedText = "";
+	}
+
+	/** Find the run waiting for a conversation, including the in-flight dispatch. */
+	findRun(conversationId) {
+		const run = this.pendingRuns.get(conversationId);
+		if (run) return run;
+		if (this.activeDispatch?.run && !this.activeDispatch.run.finished) {
+			this.activeDispatch.earlyConversationId = conversationId;
+			return this.activeDispatch.run;
+		}
+		return null;
+	}
+
+	/** Whether a run event predates this Discord turn and must be ignored. */
+	isStaleRunEvent(run, eventAt) {
+		if (!run || !eventAt) return false;
+		const dispatchedAt = Number(run.dispatchedAt || 0);
+		if (!dispatchedAt) return false;
+		return eventAt < dispatchedAt - EVENT_CLOCK_SKEW_MS;
+	}
+
+	/** Debounce the end of a shared-conversation turn. */
+	scheduleRunSettle(run) {
+		this.clearRunSettle(run);
+		run.settleTimer = setTimeout(() => {
+			run.settleTimer = null;
+			void this.finishRun(run);
+		}, SHARED_RUN_SETTLE_MS);
+		run.settleTimer.unref?.();
+	}
+
+	/** Cancel a pending shared-conversation settle timer. */
+	clearRunSettle(run) {
+		if (!run?.settleTimer) return;
+		clearTimeout(run.settleTimer);
+		run.settleTimer = null;
 	}
 
 	async finishRun(run, { timedOut = false } = {}) {
 		if (!run || run.finished) return;
 		run.finished = true;
 		if (run.timeoutTimer) clearTimeout(run.timeoutTimer);
+		this.clearRunSettle(run);
 		if (run.conversationId) this.pendingRuns.delete(run.conversationId);
 		this.earlyRuns.delete(run.conversationId);
 
@@ -1489,12 +1585,27 @@ export class DiscordBotBridge {
 		if (late) return late;
 		const conversationId = String(run?.conversationId || "").trim();
 		if (!conversationId) return "";
+		const since = Number(run?.startedAt || 0);
 		try {
 			const snapshot = await this.host?.conversations?.get?.(conversationId);
-			const text = extractLastAssistantText(snapshot, { since: Number(run?.startedAt || 0) });
+			const text = extractLastAssistantText(snapshot, { since });
 			if (text) return text;
 		} catch (error) {
 			this.log("warn", `Conversation transcript lookup failed: ${error?.message || error}`);
+		}
+		// Headless runs live in the plugin's own pseudo client: read that
+		// snapshot directly, the host only exposes it per client id.
+		const clientId =
+			String(run?.clientId || "").trim() ||
+			(run?.accountId ? `plugin:discord:${run.accountId}` : "");
+		if (clientId) {
+			try {
+				const snapshot = await this.host?.getActiveConversation?.({ clientId });
+				const text = extractLastAssistantText(snapshot, { since });
+				if (text) return text;
+			} catch (error) {
+				this.log("warn", `Client transcript lookup failed: ${error?.message || error}`);
+			}
 		}
 		return "";
 	}

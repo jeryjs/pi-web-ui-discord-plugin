@@ -294,3 +294,105 @@ test("/cancel aborts the running task of the invoking user", async () => {
 	const reply = harness.apiCalls.filter((call) => call.method === "POST").at(-1);
 	assert.match(reply.payload.content, /Cancelled the running task/);
 });
+
+test("a shared conversation only ships the Discord turn's own output", async () => {
+	const base = Date.now();
+	const harness = createHarness({
+		active: { conversationId: "c7", cwd: "/home/jery" },
+		hostChat: async (request, bridge) => {
+			const conversationId = request.conversationId || "c1";
+			setImmediate(async () => {
+				// The browser tab was already running a turn when Discord dispatched.
+				await bridge.handleRunEvent({
+					type: "run_start",
+					conversationId,
+					at: base - 60_000,
+				});
+				await bridge.handleRunEvent({
+					type: "message",
+					conversationId,
+					at: base - 60_000,
+					message: { role: "assistant", content: "stale browser answer" },
+				});
+				await bridge.handleRunEvent({
+					type: "message",
+					conversationId,
+					at: Date.now(),
+					message: { role: "assistant", content: "browser answer" },
+				});
+				// Our turn starts, so the browser's output is dropped.
+				await bridge.handleRunEvent({ type: "run_start", conversationId, at: Date.now() });
+				await bridge.handleRunEvent({
+					type: "message",
+					conversationId,
+					at: Date.now(),
+					message: { role: "assistant", content: "discord answer" },
+				});
+				await bridge.handleRunEvent({ type: "run_end", conversationId, at: Date.now() });
+			});
+			return { conversationId, clientId: "browser-client" };
+		},
+	});
+	await harness.bridge.onInboundMessage(message("hello"));
+	const reply = harness.apiCalls.filter(
+		(call) => call.method === "POST" && call.path === `/channels/${CHANNEL_ID}/messages`,
+	);
+	assert.equal(reply.at(-1).payload.content, "discord answer");
+});
+
+test("a shared conversation waits for its own turn before replying", async () => {
+	const harness = createHarness({
+		active: { conversationId: "c7", cwd: "/home/jery" },
+		hostChat: async (request, bridge) => {
+			const conversationId = request.conversationId || "c1";
+			setImmediate(async () => {
+				// The browser tab's turn ends before ours starts.
+				await bridge.handleRunEvent({ type: "run_end", conversationId, at: Date.now() });
+				await new Promise((resolve) => setTimeout(resolve, 20));
+				await bridge.handleRunEvent({
+					type: "message",
+					conversationId,
+					at: Date.now(),
+					message: { role: "assistant", content: "discord answer" },
+				});
+				await bridge.handleRunEvent({ type: "run_end", conversationId, at: Date.now() });
+			});
+			return { conversationId, clientId: "browser-client" };
+		},
+	});
+	await harness.bridge.onInboundMessage(message("hello"));
+	const reply = harness.apiCalls.filter(
+		(call) => call.method === "POST" && call.path === `/channels/${CHANNEL_ID}/messages`,
+	);
+	assert.equal(reply.at(-1).payload.content, "discord answer");
+});
+
+test("a run without message events recovers the text from the pseudo client transcript", async () => {
+	const harness = createHarness({
+		hostChat: async (request, bridge) => {
+			setImmediate(async () => {
+				await bridge.handleRunEvent({ type: "run_end", conversationId: "c1" });
+			});
+			return { conversationId: "c1", clientId: `plugin:discord:${request.accountId}` };
+		},
+	});
+	harness.host.getActiveConversation = async (options) =>
+		String(options?.clientId || "").startsWith("plugin:discord:")
+			? {
+					conversationId: "c1",
+					messages: [
+						{ role: "user", content: "hello", timestamp: 1 },
+						{
+							role: "assistant",
+							content: [{ type: "text", text: "recovered answer" }],
+							timestamp: 2,
+						},
+					],
+				}
+			: null;
+	await harness.bridge.onInboundMessage(message("hello"));
+	const reply = harness.apiCalls.filter(
+		(call) => call.method === "POST" && call.path === `/channels/${CHANNEL_ID}/messages`,
+	);
+	assert.equal(reply.at(-1).payload.content, "recovered answer");
+});
