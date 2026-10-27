@@ -70,7 +70,7 @@ To install under a different plugin ID, omit `--name discord`. The Discord bot p
 | Workspace | `/cwd [path]` | `/cwd [path]`, `/workspace [path]` | Shows or changes the workspace. Changing it also starts a fresh session. |
 | Model | `/model [provider/model]` | `/model [provider/model]` | Shows or changes the model used for subsequent Discord prompts. |
 
-`/cwd` and `/model` use Discord autocomplete. Plain-text commands in a guild must mention the bot (for example, `@Nero /status`); direct messages do not require a mention.
+`/cwd` and `/model` use Discord autocomplete. Plain-text commands in a guild must mention the bot (for example, `@Nero /status`); direct messages do not require a mention, and channels listed under `autoReplyChannels` (plus the default channel when `autoReplyEnabled` is on) accept every message without a mention.
 
 ## Configuration
 
@@ -84,9 +84,39 @@ The dashboard stores these values:
 | `defaultChannelId` | Default channel for dashboard and AI-tool messages. |
 | `workspace` | Default workspace directory. |
 | `model` | Default `provider/model` ID. |
-| `thinkingLevel` | Optional pi thinking level. |
+| `thinkingLevel` | Optional pi thinking level; changed with `/thinking`. |
+| `systemPrompt` | The Discord core system prompt; changed with `/system`. |
+| `systemPromptMode` | How the core prompt was last set: `replace` or `append`. |
+| `autoReplyEnabled` | Answers every message in `defaultChannelId` without an @mention. |
+| `autoReplyChannels` | Extra channel IDs that answer every message without an @mention. |
+| `useWorkspaceSession` | Reuses the pi session open in pi-web-ui for the same workspace (default on). |
 
 Per-user `/cwd` overrides are stored under the plugin's `userWorkspaces` storage key. The bot token is never written to plaintext `storage.json`.
+
+## Workspace session reuse, automatic replies, and reply context
+
+**Permanent session.** By default the bot continues the pi-web-ui conversation that is open for the
+configured workspace: the plugin resolves the live conversation through the host API and passes its
+conversation ID with the prompt, so Discord and the browser share one pi session instead of racing two
+independent ones. When no live session matches the workspace, the bot falls back to its own stable
+per-user pseudo-client session. Turn the behavior off with `useWorkspaceSession: false`.
+
+**Automatic replies.** Set `autoReplyEnabled` (default channel) or list channel IDs in
+`autoReplyChannels` to answer every message in those channels without an @mention. Replying to one of
+the bot's own messages always reaches the bot, even outside those channels.
+
+**Reply context.** When a message is a Discord reply, the referenced message is fetched (Discord only
+embeds it when the bot has it cached) and passed to the agent inside a `<discord_reply_context>` block
+together with the author, so "what about this?" carries the quoted message.
+
+**Core system prompt.** `/system` manages the prompt that is prepended to every Discord-routed
+message. The plugin API cannot change pi-web-ui's host-wide system prompt, so the Discord core prompt
+is scoped to Discord turns and stored in the same plugin configuration as workspace, model, and
+thinking level.
+
+**Reply robustness.** A finished turn reads its answer back from the host transcript when no assistant
+message event carried the text, and reports the real error when the model failed. The bot no longer
+answers "no text output" for a turn that has an answer in the session file.
 
 ## Session isolation and reset behavior
 
