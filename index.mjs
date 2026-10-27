@@ -14,7 +14,7 @@ import { chunkMarkdownText } from "./markdown-chunks.mjs";
 export const SECRET_BOT_TOKEN = "discord.botToken";
 
 export const DISCORD_API_BASE = "https://discord.com/api/v10";
-export const PLUGIN_VERSION = "1.2.2";
+export const PLUGIN_VERSION = "1.3.0";
 
 export const DISCORD_INTENTS = Object.freeze({
 	GUILDS: 1 << 0,
@@ -53,6 +53,11 @@ export const INTERACTION_RESPONSE_TYPE = Object.freeze({
 export const DISCORD_EPHEMERAL_FLAG = 64;
 export const DISCORD_MESSAGE_LIMIT = 1950;
 export const DISCORD_AUTOCOMPLETE_LIMIT = 25;
+
+/** Default number of recent channel messages pulled in as context. */
+export const DISCORD_READ_DEFAULT_COUNT = 5;
+/** Upper bound for the channel history window Discord allows us to request. */
+export const DISCORD_READ_MAX_COUNT = 50;
 
 /** Native application commands registered in every guild where the bot is present. */
 export const THINKING_LEVELS = Object.freeze(["off", "low", "medium", "high", "max"]);
@@ -144,6 +149,48 @@ export const DISCORD_COMMANDS = Object.freeze([
 				required: false,
 			}),
 		]),
+	}),
+	Object.freeze({
+		name: "read",
+		description: "Read the last messages in this channel",
+		type: 1,
+		options: Object.freeze([
+			Object.freeze({
+				name: "count",
+				description: `How many messages to read (1-${DISCORD_READ_MAX_COUNT}, default ${DISCORD_READ_DEFAULT_COUNT})`,
+				type: 4,
+				required: false,
+				min_value: 1,
+				max_value: DISCORD_READ_MAX_COUNT,
+			}),
+		]),
+	}),
+	Object.freeze({
+		name: "pi",
+		description: "Send a prompt to the pi agent",
+		type: 1,
+		options: Object.freeze([
+			Object.freeze({
+				name: "message",
+				description: "The prompt for the pi agent",
+				type: 3,
+				required: true,
+			}),
+			Object.freeze({
+				name: "context",
+				description: `How many recent channel messages to include as context (1-${DISCORD_READ_MAX_COUNT}, default ${DISCORD_READ_DEFAULT_COUNT})`,
+				type: 4,
+				required: false,
+				min_value: 1,
+				max_value: DISCORD_READ_MAX_COUNT,
+			}),
+		]),
+	}),
+	Object.freeze({
+		name: "pi-message",
+		// Discord rejects a description on context-menu commands.
+		description: "",
+		type: 3,
 	}),
 ]);
 
@@ -367,6 +414,65 @@ export function buildReplyContext(referencedMessage, { botId = "", limit = 1500 
 	return `Replying to ${who}${suffix}:\n${body}`;
 }
 
+/**
+ * Clamp a requested channel-history count.
+ *
+ * A zero result means "do not attach any context".
+ */
+export function normalizeReadCount(value, fallback = DISCORD_READ_DEFAULT_COUNT) {
+	const text = String(value ?? "").trim();
+	if (!text) return fallback;
+	const raw = Number(text);
+	if (!Number.isFinite(raw)) return fallback;
+	const count = Math.floor(raw);
+	if (count <= 0) return 0;
+	return Math.min(count, DISCORD_READ_MAX_COUNT);
+}
+
+/**
+ * Format recent channel messages into a context block for the agent.
+ *
+ * Discord returns messages newest-first; the block is rendered oldest-first so
+ * the agent reads the conversation in chronological order.
+ */
+export function formatChannelContext(messages, { botId = "", messageLimit = 1000 } = {}) {
+	const list = Array.isArray(messages) ? messages : [];
+	const rows = [];
+	for (const message of [...list].reverse()) {
+		const content = String(message?.content || "").trim();
+		if (!content) continue;
+		const author = message?.author || {};
+		const authorId = String(author?.id || "").trim();
+		const isBot = Boolean(author?.bot) || (botId && authorId === String(botId));
+		const name = String(author?.global_name || author?.username || "").trim();
+		const who = isBot ? "the bot" : name ? `@${name}` : authorId ? `user ${authorId}` : "someone";
+		const body = content.length > messageLimit ? `${content.slice(0, messageLimit)}…` : content;
+		rows.push(`${who}: ${body}`);
+	}
+	if (!rows.length) return "";
+	return ["Recent messages in this Discord channel:", ...rows.map((row) => `- ${row}`)].join("\n");
+}
+
+/**
+ * Render recent channel messages as a readable transcript.
+ */
+export function formatChannelTranscript(messages, { botId = "", messageLimit = 500 } = {}) {
+	const list = Array.isArray(messages) ? messages : [];
+	const rows = [];
+	for (const message of [...list].reverse()) {
+		const author = message?.author || {};
+		const authorId = String(author?.id || "").trim();
+		const isBot = Boolean(author?.bot) || (botId && authorId === String(botId));
+		const name = String(author?.global_name || author?.username || authorId || "someone").trim();
+		const content = String(message?.content || "").trim();
+		const body = content ? (content.length > messageLimit ? `${content.slice(0, messageLimit)}…` : content) : "(no text content)";
+		const stamp = String(message?.timestamp || "").trim();
+		const when = stamp ? stamp.replace("T", " ").replace(/\.\d+Z$/, " UTC") : "";
+		rows.push(`- ${isBot ? "the bot" : `@${name}`}${when ? ` · ${when}` : ""}: ${body}`);
+	}
+	return rows;
+}
+
 /** Extract the newest assistant text from a conversation snapshot. */
 export function extractLastAssistantText(conversation, { since = 0 } = {}) {
 	const messages = Array.isArray(conversation?.messages) ? conversation.messages : [];
@@ -442,7 +548,10 @@ export async function discordApi(token, method, path, payload = null, { timeoutM
 	});
 	if (!response.ok) {
 		const body = await response.json().catch(() => ({}));
-		throw new Error(body.message || `Discord HTTP ${response.status}`);
+		const error = new Error(body.message || `Discord HTTP ${response.status}`);
+		error.status = response.status;
+		error.code = body.code;
+		throw error;
 	}
 	if (response.status === 204) return null;
 	return await response.json();
@@ -972,25 +1081,76 @@ export class DiscordBotBridge {
 	 */
 	interactionFlags(interaction) {
 		const context = Number(interaction?.context ?? 0);
-		return context === INTERACTION_CONTEXT.BOT_DM ? undefined : DISCORD_EPHEMERAL_FLAG;
+		return context === INTERACTION_CONTEXT.BOT_DM ? null : DISCORD_EPHEMERAL_FLAG;
 	}
 
-	async deferInteraction(interaction) {
+	/**
+	 * Reply flags for a prompt response.
+	 *
+	 * A guild channel and the app's own DM can carry a public reply — that is
+	 * what the @mention flow posts. A third-party DM has no bot presence for a
+	 * user-installed app, so the answer must stay ephemeral or delivery fails.
+	 * The same applies to a guild where the app is only installed to the user's
+	 * account: without a guild membership the bot cannot post there.
+	 */
+	promptInteractionFlags(interaction) {
+		const context = Number(interaction?.context ?? 0);
+		if (context === INTERACTION_CONTEXT.PRIVATE_CHANNEL) return DISCORD_EPHEMERAL_FLAG;
+		const guildId = String(interaction?.guild_id || "").trim();
+		if (guildId && !this.knownGuilds.has(guildId)) return DISCORD_EPHEMERAL_FLAG;
+		return null;
+	}
+
+	async deferInteraction(interaction, flags = this.interactionFlags(interaction)) {
 		await this.respondToInteraction(interaction, {
 			type: INTERACTION_RESPONSE_TYPE.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE,
-			data: { ...(this.interactionFlags(interaction) !== undefined ? { flags: this.interactionFlags(interaction) } : {}) },
+			data: { ...(flags !== null ? { flags } : {}) },
 		});
 	}
 
-	async editInteractionResponse(interaction, content) {
+	async editInteractionResponse(interaction, content, flags = this.interactionFlags(interaction)) {
 		const applicationId = String(interaction?.application_id || this.applicationId || "").trim();
 		if (!applicationId) throw new Error("Discord application ID is unavailable.");
 		return this.api(
 			this.getConfig().botToken,
 			"PATCH",
 			`/webhooks/${applicationId}/${interaction.token}/messages/@original`,
-			{ content, ...(this.interactionFlags(interaction) !== undefined ? { flags: this.interactionFlags(interaction) } : {}) },
+			{ content, ...(flags !== null ? { flags } : {}) },
 		);
+	}
+
+	/** Post an additional chunk through the interaction webhook. */
+	async postInteractionFollowup(interaction, content, flags = this.interactionFlags(interaction)) {
+		const applicationId = String(interaction?.application_id || this.applicationId || "").trim();
+		if (!applicationId) throw new Error("Discord application ID is unavailable.");
+		return this.api(
+			this.getConfig().botToken,
+			"POST",
+			`/webhooks/${applicationId}/${interaction.token}`,
+			{ content, ...(flags !== null ? { flags } : {}) },
+		);
+	}
+
+	/**
+	 * Answer an interaction with possibly long content.
+	 *
+	 * Discord caps a single message at 2000 characters, so the text is split
+	 * and the overflow is posted as webhook follow-ups.
+	 */
+	async sendInteractionContent(interaction, content, { edit = false, flags = this.interactionFlags(interaction) } = {}) {
+		const chunks = chunkMarkdownText(content, DISCORD_MESSAGE_LIMIT);
+		if (!chunks.length) return;
+		if (edit) {
+			await this.editInteractionResponse(interaction, chunks[0], flags);
+		} else {
+			await this.respondToInteraction(interaction, {
+				type: INTERACTION_RESPONSE_TYPE.CHANNEL_MESSAGE_WITH_SOURCE,
+				data: { content: chunks[0], ...(flags !== null ? { flags } : {}) },
+			});
+		}
+		for (const chunk of chunks.slice(1)) {
+			await this.postInteractionFollowup(interaction, chunk, flags);
+		}
 	}
 
 	async handleApplicationCommand(interaction) {
@@ -1001,9 +1161,23 @@ export class DiscordBotBridge {
 				type: INTERACTION_RESPONSE_TYPE.CHANNEL_MESSAGE_WITH_SOURCE,
 				data: {
 					content: "Access denied. Add your Discord User ID to the bot allowlist in pi-web-ui.",
-					...(this.interactionFlags(interaction) !== undefined ? { flags: this.interactionFlags(interaction) } : {}),
+					...(this.interactionFlags(interaction) !== null ? { flags: this.interactionFlags(interaction) } : {}),
 				},
 			});
+			return;
+		}
+
+		const name = String(interaction?.data?.name || "").toLowerCase();
+
+		// `/pi` and `/pi-message` run the agent, so they own the whole
+		// interaction lifecycle (defer, dispatch, edit) instead of the
+		// single-reply command flow below.
+		if (name === "pi" || name === "pi-message") {
+			await this.handlePromptCommand(interaction, { authorId, config, name });
+			return;
+		}
+		if (name === "read") {
+			await this.handleReadCommand(interaction, { authorId, config });
 			return;
 		}
 
@@ -1015,7 +1189,6 @@ export class DiscordBotBridge {
 			this.log("warn", `Discord interaction defer failed: ${error?.message || error}`);
 		}
 
-		const name = String(interaction?.data?.name || "").toLowerCase();
 		let args = "";
 		if (name === "cwd") args = interactionOption(interaction, "path");
 		if (name === "model") args = interactionOption(interaction, "model");
@@ -1030,13 +1203,8 @@ export class DiscordBotBridge {
 		try {
 			const content = await this.executeCommand(name, args, { authorId, config });
 			const finalContent = content || `Unknown command: /${name}`;
-			if (deferred) await this.editInteractionResponse(interaction, finalContent);
-			else {
-				await this.respondToInteraction(interaction, {
-					type: INTERACTION_RESPONSE_TYPE.CHANNEL_MESSAGE_WITH_SOURCE,
-					data: { content: finalContent, ...(this.interactionFlags(interaction) !== undefined ? { flags: this.interactionFlags(interaction) } : {}) },
-				});
-			}
+			if (deferred) await this.sendInteractionContent(interaction, finalContent, { edit: true });
+			else await this.sendInteractionContent(interaction, finalContent);
 		} catch (error) {
 			const finalContent = `Command failed: ${error?.message || error}`;
 			if (deferred) {
@@ -1044,10 +1212,134 @@ export class DiscordBotBridge {
 			} else {
 				await this.respondToInteraction(interaction, {
 					type: INTERACTION_RESPONSE_TYPE.CHANNEL_MESSAGE_WITH_SOURCE,
-					data: { content: finalContent, ...(this.interactionFlags(interaction) !== undefined ? { flags: this.interactionFlags(interaction) } : {}) },
+					data: { content: finalContent, ...(this.interactionFlags(interaction) !== null ? { flags: this.interactionFlags(interaction) } : {}) },
 				}).catch(() => {});
 			}
 		}
+	}
+
+	/**
+	 * Fetch the most recent messages of a channel.
+	 *
+	 * A user-installed app has no presence in a third-party DM or group chat, so
+	 * Discord denies this endpoint there. The caller degrades gracefully instead
+	 * of failing the whole command.
+	 */
+	async fetchChannelMessages(channelId, count, config = this.getConfig()) {
+		const limit = normalizeReadCount(count, 0);
+		const channel = String(channelId || "").trim();
+		if (!channel || limit <= 0) return { messages: [], error: "", limit };
+		try {
+			const messages = await this.api(config?.botToken, "GET", `/channels/${channel}/messages?limit=${limit}`);
+			return { messages: Array.isArray(messages) ? messages : [], error: "", limit };
+		} catch (error) {
+			return { messages: [], error: String(error?.message || error), limit };
+		}
+	}
+
+	/**
+	 * Build the recent-message context block for a channel.
+	 */
+	async buildChannelContext(channelId, count, config = this.getConfig()) {
+		const requested = normalizeReadCount(count, DISCORD_READ_DEFAULT_COUNT);
+		if (requested <= 0) return { text: "", error: "", requested, available: 0 };
+		const result = await this.fetchChannelMessages(channelId, requested, config);
+		return {
+			text: formatChannelContext(result.messages, { botId: String(this.botUser?.id || "") }),
+			error: result.error,
+			requested,
+			available: result.messages.length,
+		};
+	}
+
+	/**
+	 * Explain that Discord will not let a user-installed app read a channel.
+	 */
+	historyUnavailableMessage(error = "") {
+		return [
+			"❌ Could not read the channel history here.",
+			error ? `- Discord said: ${error}` : "",
+			"- Apps installed to a user account have no presence in third-party DMs and group chats, so Discord only lets them answer the interaction itself.",
+			"- `/pi <message>` still works everywhere — it sends the prompt without the channel transcript.",
+			"- To use a specific message as the prompt, right-click it → Apps → **pi-message**.",
+		]
+			.filter(Boolean)
+			.join("\n");
+	}
+
+	/**
+	 * Handle `/read` — show the most recent messages of the current channel.
+	 */
+	async handleReadCommand(interaction, { authorId = "", config = this.getConfig() } = {}) {
+		const channelId = String(interaction?.channel_id || "").trim();
+		if (!channelId) {
+			await this.sendInteractionContent(interaction, "❌ `/read` needs a channel context.");
+			return;
+		}
+		const requested = normalizeReadCount(interactionOption(interaction, "count"), DISCORD_READ_DEFAULT_COUNT);
+		const result = await this.fetchChannelMessages(channelId, requested, config);
+		if (result.error) {
+			await this.sendInteractionContent(interaction, this.historyUnavailableMessage(result.error));
+			return;
+		}
+		if (!result.messages.length) {
+			await this.sendInteractionContent(interaction, "📭 No messages found in this channel.");
+			return;
+		}
+		const rows = formatChannelTranscript(result.messages, { botId: String(this.botUser?.id || "") });
+		const header = `### Last ${result.messages.length} message${result.messages.length === 1 ? "" : "s"} in this channel`;
+		await this.sendInteractionContent(interaction, [header, "", ...rows].join("\n"));
+	}
+
+	/**
+	 * Handle `/pi` and `/pi-message` — run a prompt through the agent.
+	 *
+	 * The prompt travels through exactly the same pipeline as an @mention, so
+	 * the conversation, workspace, model, and thinking level are shared.
+	 */
+	async handlePromptCommand(interaction, { authorId = "", config = this.getConfig(), name = "pi" } = {}) {
+		const channelId = String(interaction?.channel_id || "").trim();
+		const flags = this.promptInteractionFlags(interaction);
+		let prompt = "";
+		let requested = DISCORD_READ_DEFAULT_COUNT;
+
+		if (name === "pi-message") {
+			const targetId = String(interaction?.data?.target_id || "").trim();
+			const resolved = interaction?.data?.resolved?.messages || {};
+			prompt = String(resolved?.[targetId]?.content || "").trim();
+			requested = 1;
+		} else {
+			prompt = String(interactionOption(interaction, "message") || "").trim();
+			requested = normalizeReadCount(interactionOption(interaction, "context"), DISCORD_READ_DEFAULT_COUNT);
+		}
+
+		if (!prompt) {
+			await this.respondToInteraction(interaction, {
+				type: INTERACTION_RESPONSE_TYPE.CHANNEL_MESSAGE_WITH_SOURCE,
+				data: { content: "❌ `/pi` needs a message to send to the agent.", ...(flags !== null ? { flags } : {}) },
+			});
+			return;
+		}
+
+		let deferred = false;
+		try {
+			await this.deferInteraction(interaction, flags);
+			deferred = true;
+		} catch (error) {
+			this.log("warn", `Discord interaction defer failed: ${error?.message || error}`);
+		}
+
+		const context = await this.buildChannelContext(channelId, requested, config);
+		if (context.error) {
+			this.log("info", `Discord channel history unavailable for ${channelId}: ${context.error}`);
+		}
+
+		this.status.messagesReceived += 1;
+		this.status.lastMessageAt = Date.now();
+
+		const run = this.createRun({ channelId, authorId, interaction: deferred ? interaction : null });
+		const request = await this.buildRequest({ text: prompt, config, replyContext: context.text, authorId });
+		await this.enqueueDispatch(run, request);
 	}
 
 	async handleAutocompleteInteraction(interaction) {
@@ -1113,6 +1405,9 @@ export class DiscordBotBridge {
 				"- `/system` — show the current Discord core system prompt.",
 				"- `/system replace <text>` — replace the core system prompt.",
 				"- `/system append <text>` — append to the core system prompt.",
+				"- `/read [count]` — read the last messages in this channel (default 5).",
+				"- `/pi <message> [context]` — send a prompt to the agent, like @pi but usable in DMs.",
+				"- `pi-message` — right-click a message → Apps → pi-message, to use it as the prompt.",
 				"",
 				"Native slash commands are registered globally and per guild.",
 				"Installing this app to your own account lets you use it in your servers, DMs, and group chats.",
@@ -1352,19 +1647,35 @@ export class DiscordBotBridge {
 		this.status.lastMessageAt = Date.now();
 
 		const parsed = parseLegacyCommand(cleanText);
-		if (parsed && DISCORD_COMMANDS.some((command) => command.name === parsed.name)) {
+		if (parsed && DISCORD_COMMANDS.some((command) => command.type === 1 && command.name === parsed.name)) {
 			await this.handleLegacyCommand(parsed, { channelId, authorId, replyToId: message.id, config });
 			return;
 		}
 
 		void this.api(config.botToken, "POST", `/channels/${channelId}/typing`, null).catch(() => {});
 
-		const accountId = this.userAccountId(authorId);
+		const replyContext = buildReplyContext(referencedMessage, { botId });
+		const run = this.createRun({ channelId, authorId, replyToMessageId: message.id });
+		const request = await this.buildRequest({ text: cleanText, config, replyContext, authorId });
+
+		await this.enqueueDispatch(run, request);
+	}
+
+	/**
+	 * Create the bookkeeping record for one agent turn.
+	 *
+	 * `interaction` is set when the turn was started by a slash command: the
+	 * answer is then published through the interaction response instead of a
+	 * channel message, which is the only channel a user-installed app can use
+	 * in a third-party DM.
+	 */
+	createRun({ channelId = "", authorId = "", replyToMessageId = "", interaction = null } = {}) {
 		const generation = Number(this.userGenerations.get(authorId) || 0);
 		const run = {
 			channelId,
 			authorId,
-			replyToMessageId: message.id,
+			replyToMessageId,
+			interaction,
 			accumulatedText: "",
 			startedAt: Date.now(),
 			dispatchedAt: 0,
@@ -1389,10 +1700,14 @@ export class DiscordBotBridge {
 			run.resolveCompletion = resolve;
 		});
 		run.completion = completion;
+		return run;
+	}
 
-		const replyContext = buildReplyContext(referencedMessage, { botId });
+	/** Build the pi-web-ui request for one agent turn. */
+	async buildRequest({ text = "", config = {}, replyContext = "", authorId = "" } = {}) {
+		const accountId = this.userAccountId(authorId);
 		const request = {
-			text: buildRequestText({ text: cleanText, config, replyContext }),
+			text: buildRequestText({ text, config, replyContext }),
 			accountId,
 		};
 		const workspace = this.resolveWorkspace(authorId, config);
@@ -1401,12 +1716,35 @@ export class DiscordBotBridge {
 		if (config.thinkingLevel) request.thinkingLevel = config.thinkingLevel;
 		const sessionTarget = await this.resolveWorkspaceConversation(authorId, config);
 		if (sessionTarget) request.conversationId = sessionTarget;
-
-		await this.enqueueDispatch(run, request);
+		return request;
 	}
 
 	async handleLegacyCommand(parsed, { channelId, authorId, replyToId, config }) {
 		try {
+			if (parsed.name === "pi") {
+				await this.runLegacyPrompt({ text: parsed.args, channelId, authorId, replyToId, config });
+				return true;
+			}
+			if (parsed.name === "read") {
+				const count = normalizeReadCount(parsed.args, DISCORD_READ_DEFAULT_COUNT);
+				const result = await this.fetchChannelMessages(channelId, count, config);
+				const content = result.error
+					? this.historyUnavailableMessage(result.error)
+					: result.messages.length
+						? [
+								`### Last ${result.messages.length} message${result.messages.length === 1 ? "" : "s"} in this channel`,
+								"",
+								...formatChannelTranscript(result.messages, { botId: String(this.botUser?.id || "") }),
+							].join("\n")
+						: "📭 No messages found in this channel.";
+				for (const chunk of chunkMarkdownText(content, DISCORD_MESSAGE_LIMIT)) {
+					await this.api(config.botToken, "POST", `/channels/${channelId}/messages`, {
+						content: chunk,
+						message_reference: replyToId ? { message_id: replyToId } : undefined,
+					});
+				}
+				return true;
+			}
 			const content = await this.executeCommand(parsed.name, parsed.args, { authorId, config });
 			if (content === null) return false;
 			await this.api(config.botToken, "POST", `/channels/${channelId}/messages`, {
@@ -1421,6 +1759,24 @@ export class DiscordBotBridge {
 			}).catch(() => {});
 			return true;
 		}
+	}
+
+	/**
+	 * Run a prompt typed as plain text (`/pi ...` without picking the command).
+	 */
+	async runLegacyPrompt({ text = "", channelId = "", authorId = "", replyToId = "", config = this.getConfig() } = {}) {
+		const prompt = String(text || "").trim();
+		if (!prompt) {
+			await this.api(config.botToken, "POST", `/channels/${channelId}/messages`, {
+				content: "❌ `/pi` needs a message to send to the agent.",
+				message_reference: replyToId ? { message_id: replyToId } : undefined,
+			}).catch(() => {});
+			return;
+		}
+		const context = await this.buildChannelContext(channelId, DISCORD_READ_DEFAULT_COUNT, config);
+		const run = this.createRun({ channelId, authorId, replyToMessageId: replyToId });
+		const request = await this.buildRequest({ text: prompt, config, replyContext: context.text, authorId });
+		await this.enqueueDispatch(run, request);
 	}
 
 	enqueueDispatch(run, request) {
@@ -1625,6 +1981,23 @@ export class DiscordBotBridge {
 		}
 		const finalText = stripInternalMarkers(rawText) || this.describeEmptyRun(run);
 		const chunks = chunkMarkdownText(finalText, DISCORD_MESSAGE_LIMIT);
+
+		// A slash-command turn publishes through the interaction response: it is
+		// the only surface a user-installed app may use in a third-party DM.
+		if (run.interaction) {
+			try {
+				await this.sendInteractionContent(run.interaction, finalText, {
+					edit: true,
+					flags: this.promptInteractionFlags(run.interaction),
+				});
+				this.status.messagesReplied += 1;
+				this.status.lastReplyAt = Date.now();
+			} catch (error) {
+				this.status.lastError = error?.message || String(error);
+				this.log("warn", `Discord interaction reply delivery failed: ${this.status.lastError}`);
+			}
+			return;
+		}
 
 		try {
 			for (let index = 0; index < chunks.length; index++) {

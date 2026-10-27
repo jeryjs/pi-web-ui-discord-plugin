@@ -69,8 +69,19 @@ To install under a different plugin ID, omit `--name discord`. The Discord bot p
 | Clear session | `/clear` | `/clear` | Alias of `/new`. |
 | Workspace | `/cwd [path]` | `/cwd [path]`, `/workspace [path]` | Shows or changes the workspace. Changing it also starts a fresh session. |
 | Model | `/model [provider/model]` | `/model [provider/model]` | Shows or changes the model used for subsequent Discord prompts. |
+| Read | `/read [count]` | `/read [count]` | Shows the last `count` messages of the current channel (default 5). |
+| Prompt | `/pi <message> [context]` | `/pi <message>` | Sends a prompt to the pi agent through the same pipeline as an @mention. The optional `context` option sets how many recent channel messages are included (default 5). |
+| Message prompt | `pi-message` (message context menu) | — | Uses the message you right-clicked as the prompt. This is the only way to hand a message to a user-installed app in a third-party DM, where channel history is not readable. |
 
 `/cwd` and `/model` use Discord autocomplete. Plain-text commands in a guild must mention the bot (for example, `@Nero /status`); direct messages do not require a mention, and channels listed under `autoReplyChannels` (plus the default channel when `autoReplyEnabled` is on) accept every message without a mention.
+
+### Channel history in personal DMs
+
+Discord gives an app that is installed to a **user account** no presence in third-party DMs and group chats: it can answer the interaction itself but cannot read the channel history or post channel messages there. That means:
+
+- `/read` and the `context` option of `/pi` work in server channels and in the app's own DM.
+- In a third-party DM they report that the history is unavailable, and `/pi <message>` still runs — without the transcript.
+- Right-click a message → **Apps** → **pi-message** to hand that exact message to the agent. This is the only message text a user-installed app can read in such a conversation.
 
 ## Configuration
 

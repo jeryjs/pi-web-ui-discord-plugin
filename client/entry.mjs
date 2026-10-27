@@ -43,7 +43,9 @@ export default {
 							</div>
 						</div>
 						<div class="discord-metric-commands" style="margin-top: 10px; font-size: 12px; color: var(--text-dim); line-height: 1.5;">
-							Native commands: <code>/help</code>, <code>/status</code>, <code>/new</code>, <code>/clear</code>, <code>/cancel</code>, <code>/cwd</code>, <code>/model</code>, <code>/thinking</code>, and <code>/system</code>. The <code>/cwd</code> and <code>/model</code> options support autocomplete. Commands are registered globally and per guild, so they also work in DMs when the app is installed to a user account.
+							Native commands: <code>/help</code>, <code>/status</code>, <code>/new</code>, <code>/clear</code>, <code>/cancel</code>, <code>/cwd</code>, <code>/model</code>, <code>/thinking</code>, <code>/system</code>, <code>/read</code>, and <code>/pi</code>. The <code>/cwd</code> and <code>/model</code> options support autocomplete. Commands are registered globally and per guild, so they also work in DMs when the app is installed to a user account.
+							<br />
+							<code>/read [count]</code> shows the last messages of the current channel, and <code>/pi <message> [context]</code> sends a prompt to the agent just like an <code>@mention</code> — which is the way to talk to it in a personal DM. The <code>context</code> option sets how many recent channel messages are included (default 5).
 						</div>
 						<div class="discord-metric-detail" style="margin-top: 6px; font-size: 12px; color: var(--text-dim); line-height: 1.5;"></div>
 						<div style="margin-top: 8px; font-size: 12px; color: var(--text-dim); line-height: 1.5;">

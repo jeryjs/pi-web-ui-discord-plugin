@@ -7,13 +7,18 @@ import test from "node:test";
 import activate, {
 	DISCORD_COMMANDS,
 	DISCORD_GATEWAY_INTENTS,
+	DISCORD_READ_DEFAULT_COUNT,
+	DISCORD_READ_MAX_COUNT,
 	INTERACTION_RESPONSE_TYPE,
 	INTERACTION_TYPE,
 	DiscordBotBridge,
 	buildDirectoryChoices,
 	extractDiscordText,
+	formatChannelContext,
+	formatChannelTranscript,
 	isAllowedUser,
 	mergeSavedSecrets,
+	normalizeReadCount,
 	parseLegacyCommand,
 	peerAccountId,
 	stripInternalMarkers,
@@ -118,7 +123,7 @@ test("configuration helpers keep the bot token out of plaintext storage", () => 
 test("native command definitions include all required commands and autocomplete options", () => {
 	assert.deepEqual(
 		DISCORD_COMMANDS.map((command) => command.name),
-		["help", "status", "new", "clear", "cancel", "cwd", "model", "thinking", "system"],
+		["help", "status", "new", "clear", "cancel", "cwd", "model", "thinking", "system", "read", "pi", "pi-message"],
 	);
 	const cwd = DISCORD_COMMANDS.find((command) => command.name === "cwd");
 	const model = DISCORD_COMMANDS.find((command) => command.name === "model");
@@ -139,8 +144,35 @@ test("native command definitions include all required commands and autocomplete 
 	for (const option of system.options) {
 		assert.equal(option.required, false);
 	}
+
+	const read = DISCORD_COMMANDS.find((command) => command.name === "read");
+	assert.equal(read.type, 1);
+	assert.equal(read.options[0].name, "count");
+	assert.equal(read.options[0].type, 4);
+	assert.equal(read.options[0].required, false);
+	assert.equal(read.options[0].min_value, 1);
+	assert.equal(read.options[0].max_value, DISCORD_READ_MAX_COUNT);
+
+	const pi = DISCORD_COMMANDS.find((command) => command.name === "pi");
+	assert.equal(pi.type, 1);
+	assert.deepEqual(
+		pi.options.map((option) => option.name),
+		["message", "context"],
+	);
+	// Discord requires required options to be listed before optional ones.
+	assert.equal(pi.options[0].required, true);
+	assert.equal(pi.options[1].required, false);
+	assert.equal(pi.options[1].type, 4);
+
+	const piMessage = DISCORD_COMMANDS.find((command) => command.name === "pi-message");
+	assert.equal(piMessage.type, 3);
+	assert.equal(piMessage.options, undefined);
+	// Discord rejects a description on context-menu commands.
+	assert.equal(piMessage.description, "");
+
 	for (const command of DISCORD_COMMANDS) {
 		assert.match(command.name, /^[a-z0-9_-]{1,32}$/);
+		if (command.type === 3) continue;
 		assert.ok(command.description.length >= 1 && command.description.length <= 100);
 	}
 });
@@ -306,6 +338,9 @@ test("native guild commands are registered with Discord's bulk-overwrite route",
 		"model",
 		"thinking",
 		"system",
+		"read",
+		"pi",
+		"pi-message",
 	]);
 	assert.ok(harness.bridge.registeredGuilds.has("949381557267857469"));
 	await harness.bridge.registerGuildCommands("949381557267857469");
@@ -339,6 +374,9 @@ test("global commands are registered so user-installed apps can use them in DMs"
 		"model",
 		"thinking",
 		"system",
+		"read",
+		"pi",
+		"pi-message",
 	]);
 	for (const command of global.payload) {
 		assert.deepEqual(command.integration_types, [0, 1]);
@@ -469,6 +507,294 @@ test("directory autocomplete filters directories under the current workspace", a
 	} finally {
 		await rm(root, { recursive: true, force: true });
 	}
+});
+
+test("/read returns the most recent messages of the current channel", async () => {
+	const harness = createHarness();
+	harness.apiCalls.length = 0;
+	const messages = [
+		{ id: "m3", content: "third", author: { id: "user-b", username: "bee" }, timestamp: "2026-01-03T00:00:00.000Z" },
+		{ id: "m2", content: "second", author: { id: "user-a", username: "ay" }, timestamp: "2026-01-02T00:00:00.000Z" },
+		{ id: "m1", content: "first", author: { id: AUTHOR_ID, username: "jery" }, timestamp: "2026-01-01T00:00:00.000Z" },
+	];
+	harness.bridge.api = async (token, method, path, payload) => {
+		harness.apiCalls.push({ token, method, path, payload });
+		if (method === "GET" && path.startsWith(`/channels/${CHANNEL_ID}/messages`)) return messages;
+		return { id: "message-1" };
+	};
+
+	await harness.bridge.handleInteraction({
+		id: "interaction-read",
+		token: "interaction-token",
+		application_id: "1564275983425609788",
+		type: INTERACTION_TYPE.APPLICATION_COMMAND,
+		channel_id: CHANNEL_ID,
+		member: { user: { id: AUTHOR_ID } },
+		data: { name: "read", options: [{ name: "count", value: 3 }] },
+	});
+
+	const fetchCall = harness.apiCalls.find((call) => call.method === "GET");
+	assert.equal(fetchCall.path, `/channels/${CHANNEL_ID}/messages?limit=3`);
+	const response = harness.apiCalls.find((call) => call.path.includes("/callback"));
+	assert.equal(response.payload.type, INTERACTION_RESPONSE_TYPE.CHANNEL_MESSAGE_WITH_SOURCE);
+	const content = response.payload.data.content;
+	// Oldest first, with the author names.
+	assert.match(content, /Last 3 messages in this channel/);
+	assert.ok(content.indexOf("first") < content.indexOf("second"));
+	assert.match(content, /@jery.*: first/);
+});
+
+test("/read explains that a user-installed app cannot read third-party DM history", async () => {
+	const harness = createHarness();
+	harness.apiCalls.length = 0;
+	harness.bridge.api = async (token, method, path, payload) => {
+		harness.apiCalls.push({ token, method, path, payload });
+		if (method === "GET") {
+			const error = new Error("Missing Access");
+			error.status = 403;
+			error.code = 50001;
+			throw error;
+		}
+		return { id: "message-1" };
+	};
+
+	await harness.bridge.handleInteraction({
+		id: "interaction-read-denied",
+		token: "interaction-token",
+		application_id: "1564275983425609788",
+		type: INTERACTION_TYPE.APPLICATION_COMMAND,
+		channel_id: CHANNEL_ID,
+		context: 2,
+		member: { user: { id: AUTHOR_ID } },
+		data: { name: "read", options: [] },
+	});
+
+	const response = harness.apiCalls.find((call) => call.path.includes("/callback"));
+	assert.match(response.payload.data.content, /Could not read the channel history/);
+	assert.match(response.payload.data.content, /Missing Access/);
+	assert.match(response.payload.data.content, /`\/pi <message>` still works/);
+	// A third-party DM has no bot presence, so the answer stays ephemeral.
+	assert.equal(response.payload.data.flags, 64);
+});
+
+test("/pi runs the agent through the same pipeline as an @mention and answers via the interaction", async () => {
+	const harness = createHarness({
+		hostChat: async (request, bridge) => {
+			setImmediate(async () => {
+				await bridge.handleRunEvent({
+					type: "message",
+					conversationId: "c1",
+					message: { role: "assistant", content: "the answer" },
+				});
+				await bridge.handleRunEvent({ type: "run_end", conversationId: "c1" });
+			});
+			return { conversationId: "c1", clientId: `plugin:discord:${request.accountId}` };
+		},
+	});
+	harness.apiCalls.length = 0;
+	harness.bridge.api = async (token, method, path, payload) => {
+		harness.apiCalls.push({ token, method, path, payload });
+		if (method === "GET" && path.startsWith(`/channels/${CHANNEL_ID}/messages`)) {
+			return [{ id: "m1", content: "earlier context", author: { id: "user-a", username: "ay" } }];
+		}
+		return { id: "message-1" };
+	};
+
+	await harness.bridge.handleInteraction({
+		id: "interaction-pi",
+		token: "interaction-token",
+		application_id: "1564275983425609788",
+		type: INTERACTION_TYPE.APPLICATION_COMMAND,
+		channel_id: CHANNEL_ID,
+		member: { user: { id: AUTHOR_ID } },
+		data: { name: "pi", options: [{ name: "message", value: "what is up" }] },
+	});
+
+	// The prompt travels through the same host request as an @mention.
+	assert.equal(harness.chatCalls.length, 1);
+	assert.match(harness.chatCalls[0].text, /what is up/);
+	// The default context window is five messages.
+	const fetchCall = harness.apiCalls.find((call) => call.method === "GET");
+	assert.equal(fetchCall.path, `/channels/${CHANNEL_ID}/messages?limit=5`);
+	assert.match(harness.chatCalls[0].text, /earlier context/);
+
+	// The answer is published through the interaction response, not the channel.
+	const edited = harness.apiCalls.find((call) => call.method === "PATCH");
+	assert.equal(edited.path, "/webhooks/1564275983425609788/interaction-token/messages/@original");
+	assert.equal(edited.payload.content, "the answer");
+	assert.ok(!harness.apiCalls.some((call) => call.path === `/channels/${CHANNEL_ID}/messages` && call.method === "POST"));
+});
+
+test("/pi honours the optional context count and keeps its reply ephemeral in a third-party DM", async () => {
+	const harness = createHarness({
+		hostChat: async (request, bridge) => {
+			setImmediate(async () => {
+				await bridge.handleRunEvent({
+					type: "message",
+					conversationId: "c1",
+					message: { role: "assistant", content: "private answer" },
+				});
+				await bridge.handleRunEvent({ type: "run_end", conversationId: "c1" });
+			});
+			return { conversationId: "c1", clientId: `plugin:discord:${request.accountId}` };
+		},
+	});
+	harness.apiCalls.length = 0;
+	harness.bridge.api = async (token, method, path, payload) => {
+		harness.apiCalls.push({ token, method, path, payload });
+		if (method === "GET") return [];
+		return { id: "message-1" };
+	};
+
+	await harness.bridge.handleInteraction({
+		id: "interaction-pi-dm",
+		token: "interaction-token",
+		application_id: "1564275983425609788",
+		type: INTERACTION_TYPE.APPLICATION_COMMAND,
+		channel_id: CHANNEL_ID,
+		context: 2,
+		member: { user: { id: AUTHOR_ID } },
+		data: { name: "pi", options: [{ name: "message", value: "hello" }, { name: "context", value: 12 }] },
+	});
+
+	const fetchCall = harness.apiCalls.find((call) => call.method === "GET");
+	assert.equal(fetchCall.path, `/channels/${CHANNEL_ID}/messages?limit=12`);
+	const deferred = harness.apiCalls.find((call) => call.path.includes("/callback"));
+	assert.equal(deferred.payload.type, INTERACTION_RESPONSE_TYPE.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE);
+	assert.equal(deferred.payload.data.flags, 64);
+	const edited = harness.apiCalls.find((call) => call.method === "PATCH");
+	assert.equal(edited.payload.flags, 64);
+	assert.equal(edited.payload.content, "private answer");
+});
+
+test("/pi keeps a public reply in a guild where the bot is a member", async () => {
+	const harness = createHarness({
+		hostChat: async (request, bridge) => {
+			setImmediate(async () => {
+				await bridge.handleRunEvent({
+					type: "message",
+					conversationId: "c1",
+					message: { role: "assistant", content: "public answer" },
+				});
+				await bridge.handleRunEvent({ type: "run_end", conversationId: "c1" });
+			});
+			return { conversationId: "c1", clientId: `plugin:discord:${request.accountId}` };
+		},
+	});
+	harness.apiCalls.length = 0;
+	harness.bridge.knownGuilds.add("guild-1");
+	harness.bridge.api = async (token, method, path, payload) => {
+		harness.apiCalls.push({ token, method, path, payload });
+		if (method === "GET") return [];
+		return { id: "message-1" };
+	};
+
+	await harness.bridge.handleInteraction({
+		id: "interaction-pi-guild",
+		token: "interaction-token",
+		application_id: "1564275983425609788",
+		type: INTERACTION_TYPE.APPLICATION_COMMAND,
+		channel_id: CHANNEL_ID,
+		guild_id: "guild-1",
+		context: 0,
+		member: { user: { id: AUTHOR_ID } },
+		data: { name: "pi", options: [{ name: "message", value: "hello" }] },
+	});
+
+	const deferred = harness.apiCalls.find((call) => call.path.includes("/callback"));
+	assert.equal(deferred.payload.data.flags, undefined);
+	const edited = harness.apiCalls.find((call) => call.method === "PATCH");
+	assert.equal(edited.payload.flags, undefined);
+});
+
+test("the pi-message context command uses the invoked message as the prompt", async () => {
+	const harness = createHarness({
+		hostChat: async (request, bridge) => {
+			setImmediate(async () => {
+				await bridge.handleRunEvent({
+					type: "message",
+					conversationId: "c1",
+					message: { role: "assistant", content: "ack" },
+				});
+				await bridge.handleRunEvent({ type: "run_end", conversationId: "c1" });
+			});
+			return { conversationId: "c1", clientId: `plugin:discord:${request.accountId}` };
+		},
+	});
+	harness.apiCalls.length = 0;
+	harness.bridge.api = async (token, method, path, payload) => {
+		harness.apiCalls.push({ token, method, path, payload });
+		if (method === "GET") return [];
+		return { id: "message-1" };
+	};
+
+	await harness.bridge.handleInteraction({
+		id: "interaction-pi-message",
+		token: "interaction-token",
+		application_id: "1564275983425609788",
+		type: INTERACTION_TYPE.APPLICATION_COMMAND,
+		channel_id: CHANNEL_ID,
+		member: { user: { id: AUTHOR_ID } },
+		data: {
+			name: "pi-message",
+			target_id: "target-1",
+			resolved: { messages: { "target-1": { id: "target-1", content: "the selected message" } } },
+		},
+	});
+
+	assert.equal(harness.chatCalls.length, 1);
+	assert.match(harness.chatCalls[0].text, /the selected message/);
+});
+
+test("plain-text /pi still reaches the agent instead of being swallowed as a command", async () => {
+	const harness = createHarness({
+		hostChat: async (request, bridge) => {
+			setImmediate(async () => {
+				await bridge.handleRunEvent({
+					type: "message",
+					conversationId: "c1",
+					message: { role: "assistant", content: "legacy answer" },
+				});
+				await bridge.handleRunEvent({ type: "run_end", conversationId: "c1" });
+			});
+			return { conversationId: "c1", clientId: `plugin:discord:${request.accountId}` };
+		},
+	});
+	harness.apiCalls.length = 0;
+	harness.bridge.api = async (token, method, path, payload) => {
+		harness.apiCalls.push({ token, method, path, payload });
+		if (method === "GET") return [];
+		return { id: "message-1" };
+	};
+
+	await harness.bridge.onInboundMessage(message("/pi please summarise this"));
+	assert.equal(harness.chatCalls.length, 1);
+	assert.match(harness.chatCalls[0].text, /please summarise this/);
+});
+
+test("history helpers clamp counts and render channel messages", () => {
+	assert.equal(normalizeReadCount(""), DISCORD_READ_DEFAULT_COUNT);
+	assert.equal(normalizeReadCount(undefined, 5), 5);
+	assert.equal(normalizeReadCount("7"), 7);
+	assert.equal(normalizeReadCount(0), 0);
+	assert.equal(normalizeReadCount(-3), 0);
+	assert.equal(normalizeReadCount(999), DISCORD_READ_MAX_COUNT);
+	assert.equal(normalizeReadCount("not a number", 3), 3);
+
+	const messages = [
+		{ content: "newest", author: { id: "u2", username: "bee" } },
+		{ content: "oldest", author: { id: BOT_ID, bot: true } },
+	];
+	const context = formatChannelContext(messages, { botId: BOT_ID });
+	assert.match(context, /Recent messages in this Discord channel/);
+	// Oldest first so the agent reads the conversation in order.
+	assert.ok(context.indexOf("oldest") < context.indexOf("newest"));
+	assert.match(context, /the bot: oldest/);
+
+	const transcript = formatChannelTranscript(messages, { botId: BOT_ID });
+	assert.equal(transcript.length, 2);
+	assert.match(transcript[0], /the bot.*: oldest/);
+	assert.match(transcript[1], /@bee.*: newest/);
 });
 
 test("the discord agent tool accepts pi-web-ui's execute(toolCallId, params) convention", async () => {
