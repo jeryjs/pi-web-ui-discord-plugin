@@ -729,6 +729,49 @@ test("the plain-text /read and /context commands load and drop the context", asy
 	assert.equal(harness.bridge.loadedBatches(AUTHOR_ID).length, 0);
 });
 
+test("editing the core prompt mid-conversation re-states it in the running conversation", async () => {
+	const harness = createHarness({
+		hostChat: async (request, bridge) => {
+			setImmediate(async () => {
+				await bridge.handleRunEvent({
+					type: "message",
+					conversationId: "c1",
+					message: { role: "assistant", content: "ok" },
+				});
+				await bridge.handleRunEvent({ type: "run_end", conversationId: "c1" });
+			});
+			return { conversationId: "c1", clientId: `plugin:discord:${request.accountId}` };
+		},
+	});
+	harness.bridge.api = async (token, method, path, payload) => {
+		harness.apiCalls.push({ token, method, path, payload });
+		return { id: "message-1" };
+	};
+
+	await harness.bridge.onInboundMessage(message("first turn"));
+	assert.match(harness.chatCalls[0].text, /<discord_core_prompt>/);
+
+	// Edit the core prompt while the conversation is running.
+	const result = await harness.bridge.executeCommand("system", { replace: "Speak like a pirate." }, {
+		authorId: AUTHOR_ID,
+		config: harness.config,
+	});
+	assert.match(result, /replaced/);
+	assert.match(result, /current conversation/);
+
+	await harness.bridge.onInboundMessage(message("second turn"));
+	// The new prompt is stated once and supersedes the old one.
+	assert.match(harness.chatCalls[1].text, /<discord_core_prompt_update>/);
+	assert.match(harness.chatCalls[1].text, /Speak like a pirate\./);
+	assert.match(harness.chatCalls[1].text, /replaces the earlier core prompt/);
+	assert.ok(!harness.chatCalls[1].text.includes("<discord_core_prompt>"));
+
+	// And it is not repeated again on the following turn.
+	await harness.bridge.onInboundMessage(message("third turn"));
+	assert.ok(!harness.chatCalls[2].text.includes("<discord_core_prompt_update>"));
+	assert.ok(!harness.chatCalls[2].text.includes("<discord_core_prompt>"));
+});
+
 test("/read explains that a user-installed app cannot read third-party DM history", async () => {
 	const harness = createHarness();
 	harness.apiCalls.length = 0;

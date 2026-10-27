@@ -354,16 +354,36 @@ export function appendCorePrompt(config, text) {
 /**
  * Wrap the routed message with the Discord core prompt and optional context.
  *
- * The core prompt is a conversation-level instruction: it is stated once and
- * then lives in the transcript, instead of being repeated in every turn. The
- * loaded context (from `/read`) is carried by every turn until it is cleared.
+ * The core prompt is a conversation-level instruction: it is stated once when
+ * the conversation starts and then lives in the transcript, instead of being
+ * repeated in every turn. When it is edited mid-conversation, the new text is
+ * stated once and explicitly supersedes the previous one, so an edit takes
+ * effect in the running conversation instead of waiting for the next one.
+ * The loaded context (from `/read`) is carried by every turn until it is cleared.
  */
-export function buildRequestText({ text = "", config = {}, replyContext = "", loadedContext = "", includeCorePrompt = true } = {}) {
+export function buildRequestText({
+	text = "",
+	config = {},
+	replyContext = "",
+	loadedContext = "",
+	includeCorePrompt = true,
+	corePrompt = null,
+} = {}) {
 	const body = String(text || "").trim();
 	const parts = [];
-	const prompt = buildCorePrompt(config);
-	if (prompt && includeCorePrompt) {
+	const mode = corePrompt?.mode || (includeCorePrompt ? "state" : "none");
+	const prompt = String(corePrompt?.prompt || buildCorePrompt(config) || "").trim();
+	if (prompt && mode === "state") {
 		parts.push("<discord_core_prompt>", prompt, "</discord_core_prompt>");
+	}
+	if (prompt && mode === "update") {
+		parts.push(
+			"<discord_core_prompt_update>",
+			"The Discord core prompt has changed. It now reads:",
+			prompt,
+			"This replaces the earlier core prompt.",
+			"</discord_core_prompt_update>",
+		);
 	}
 	const context = String(replyContext || "").trim();
 	if (context) {
@@ -783,7 +803,7 @@ export class DiscordBotBridge {
 		this.userConversations = new Map();
 		this.userWorkspaces = new Map(Object.entries(initialUserWorkspaces || {}));
 		this.userContexts = new Map(Object.entries(initialUserContexts || {}));
-		this.corePromptGenerations = new Map();
+		this.corePromptStates = new Map();
 		this.userGenerations = new Map();
 		this.knownGuilds = new Set();
 		this.registeredGuilds = new Set();
@@ -861,17 +881,27 @@ export class DiscordBotBridge {
 	}
 
 	/**
-	 * Whether the Discord core prompt still has to be stated.
+	 * Decide what the Discord core prompt needs this turn.
 	 *
-	 * It is a conversation-level instruction, so it is injected once per
-	 * conversation and then stays in the transcript, instead of being repeated
-	 * in every single turn.
+	 * - "state": a new conversation, so the prompt is stated in full.
+	 * - "update": the prompt was edited mid-conversation, so the new text is
+	 *   stated once and explicitly supersedes the previous one.
+	 * - "none": nothing to say, it already lives in the transcript.
 	 */
-	shouldInjectCorePrompt(authorId) {
+	corePromptInjection(authorId, config = this.getConfig()) {
+		const prompt = buildCorePrompt(config);
+		if (!prompt) return { mode: "none", prompt: "" };
 		const generation = Number(this.userGenerations.get(authorId) || 0);
-		if (this.corePromptGenerations.get(authorId) === generation) return false;
-		this.corePromptGenerations.set(authorId, generation);
-		return true;
+		const state = this.corePromptStates.get(authorId);
+		if (!state || state.generation !== generation) {
+			this.corePromptStates.set(authorId, { generation, prompt });
+			return { mode: "state", prompt };
+		}
+		if (state.prompt !== prompt) {
+			this.corePromptStates.set(authorId, { generation, prompt });
+			return { mode: "update", prompt };
+		}
+		return { mode: "none", prompt: "" };
 	}
 
 	resolveWorkspace(authorId, config = this.getConfig()) {
@@ -1748,13 +1778,19 @@ export class DiscordBotBridge {
 			}
 			if (parsed.mode === "replace") {
 				await this.updateConfig({ systemPrompt: parsed.text, systemPromptMode: "replace" });
-				return "✨ Discord core system prompt replaced.";
+				return [
+					"✨ Discord core system prompt replaced.",
+					"It applies to the current conversation from the next message on.",
+				].join("\n");
 			}
 			await this.updateConfig({
 				systemPrompt: appendCorePrompt(config, parsed.text),
 				systemPromptMode: "append",
 			});
-			return "✨ Discord core system prompt updated.";
+			return [
+				"✨ Discord core system prompt updated.",
+				"It applies to the current conversation from the next message on.",
+			].join("\n");
 		}
 
 		return null;
@@ -1933,7 +1969,7 @@ export class DiscordBotBridge {
 				config,
 				replyContext,
 				loadedContext,
-				includeCorePrompt: this.shouldInjectCorePrompt(authorId),
+				corePrompt: this.corePromptInjection(authorId, config),
 			}),
 			accountId,
 		};

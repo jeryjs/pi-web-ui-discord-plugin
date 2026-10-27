@@ -141,6 +141,18 @@ conversation carries it in a `<discord_core_prompt>` block, and it then stays in
 instead of being repeated in every turn. `/new`, `/clear`, and a `/cwd` change start a new
 conversation, which states it again.
 
+Editing it mid-conversation works too: the next turn carries the new text in a
+`<discord_core_prompt_update>` block that explicitly supersedes the previous one, so the change
+takes effect in the running conversation instead of waiting for the next one. Because the core
+prompt is one shared plugin setting, an edit applies to every Discord conversation.
+
+Two different prompts are worth keeping apart:
+
+| Prompt | Where it is edited | Scope |
+| --- | --- | --- |
+| Discord core prompt | `/system replace <text>` / `/system append <text>` in Discord | Discord turns only, shared by all Discord users |
+| pi-web-ui host prompt (`{{soul}}`) | pi-web-ui settings → system prompt / prompt overrides | Every pi-web-ui session, including the browser tabs |
+
 **Reply robustness.** A finished turn reads its answer back from the host transcript when no assistant
 message event carried the text: the plugin asks the host for the conversation snapshot and, for
 headless runs, for the snapshot of its own pseudo client. The real error is reported when the model
