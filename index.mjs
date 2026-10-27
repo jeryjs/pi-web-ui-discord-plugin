@@ -14,7 +14,7 @@ import { chunkMarkdownText } from "./markdown-chunks.mjs";
 export const SECRET_BOT_TOKEN = "discord.botToken";
 
 export const DISCORD_API_BASE = "https://discord.com/api/v10";
-export const PLUGIN_VERSION = "1.3.0";
+export const PLUGIN_VERSION = "1.3.1";
 
 export const DISCORD_INTENTS = Object.freeze({
 	GUILDS: 1 << 0,
@@ -467,7 +467,7 @@ export function formatChannelTranscript(messages, { botId = "", messageLimit = 5
 		const content = String(message?.content || "").trim();
 		const body = content ? (content.length > messageLimit ? `${content.slice(0, messageLimit)}…` : content) : "(no text content)";
 		const stamp = String(message?.timestamp || "").trim();
-		const when = stamp ? stamp.replace("T", " ").replace(/\.\d+Z$/, " UTC") : "";
+		const when = stamp ? stamp.replace("T", " ").replace(/\.\d+(?:\+00:00|Z)$/, " UTC") : "";
 		rows.push(`- ${isBot ? "the bot" : `@${name}`}${when ? ` · ${when}` : ""}: ${body}`);
 	}
 	return rows;
