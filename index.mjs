@@ -14,7 +14,7 @@ import { chunkMarkdownText } from "./markdown-chunks.mjs";
 export const SECRET_BOT_TOKEN = "discord.botToken";
 
 export const DISCORD_API_BASE = "https://discord.com/api/v10";
-export const PLUGIN_VERSION = "1.0.2";
+export const PLUGIN_VERSION = "1.1.0";
 
 export const DISCORD_INTENTS = Object.freeze({
 	GUILDS: 1 << 0,
@@ -49,6 +49,9 @@ export const DISCORD_MESSAGE_LIMIT = 1950;
 export const DISCORD_AUTOCOMPLETE_LIMIT = 25;
 
 /** Native application commands registered in every guild where the bot is present. */
+export const THINKING_LEVELS = Object.freeze(["off", "low", "medium", "high", "max"]);
+
+/** Native application commands registered in every guild where the bot is present. */
 export const DISCORD_COMMANDS = Object.freeze([
 	Object.freeze({
 		name: "help",
@@ -68,6 +71,11 @@ export const DISCORD_COMMANDS = Object.freeze([
 	Object.freeze({
 		name: "clear",
 		description: "Clear the current Discord conversation context",
+		type: 1,
+	}),
+	Object.freeze({
+		name: "cancel",
+		description: "Cancel the running Discord task",
 		type: 1,
 	}),
 	Object.freeze({
@@ -98,6 +106,39 @@ export const DISCORD_COMMANDS = Object.freeze([
 			}),
 		]),
 	}),
+	Object.freeze({
+		name: "thinking",
+		description: "Show or change the thinking level used by Discord",
+		type: 1,
+		options: Object.freeze([
+			Object.freeze({
+				name: "level",
+				description: "Thinking level (leave empty to show the current one)",
+				type: 3,
+				required: false,
+				choices: THINKING_LEVELS.map((level) => Object.freeze({ name: level, value: level })),
+			}),
+		]),
+	}),
+	Object.freeze({
+		name: "system",
+		description: "Show or set the Discord core system prompt",
+		type: 1,
+		options: Object.freeze([
+			Object.freeze({
+				name: "replace",
+				description: "Replace the Discord core system prompt",
+				type: 3,
+				required: false,
+			}),
+			Object.freeze({
+				name: "append",
+				description: "Append to the Discord core system prompt",
+				type: 3,
+				required: false,
+			}),
+		]),
+	}),
 ]);
 
 const LEGACY_COMMAND_ALIASES = Object.freeze({
@@ -105,6 +146,7 @@ const LEGACY_COMMAND_ALIASES = Object.freeze({
 });
 
 const DEFAULT_RUN_TIMEOUT_MS = 10 * 60 * 1000;
+const LATE_TEXT_GRACE_MS = 1_500;
 const MODEL_CACHE_MS = 30_000;
 const AUTOCOMPLETE_TIMEOUT_MS = 2_000;
 
@@ -150,6 +192,163 @@ export function parseLegacyCommand(text) {
 	};
 }
 
+/**
+ * Default Discord core system prompt.
+ *
+ * The plugin API cannot change pi-web-ui's host-wide system prompt, so Discord
+ * runs get their own core prompt that is prepended to every routed message.
+ */
+export const DEFAULT_CORE_PROMPT = [
+	"You are Nero, the pi-web-ui coding agent assistant connected to Discord.",
+	"Answer with concise, actionable results and reference concrete file paths.",
+].join(" ");
+
+/** Normalize a thinking level; an empty result means "follow the host default". */
+export function normalizeThinkingLevel(value) {
+	const text = String(value ?? "").trim().toLowerCase();
+	if (!text) return "";
+	if (["default", "host", "none", "reset"].includes(text)) return "";
+	return THINKING_LEVELS.includes(text) ? text : "";
+}
+
+/** Normalize the list of channels where every message reaches the bot. */
+export function normalizeAutoReplyChannels(value) {
+	const values = Array.isArray(value) ? value : String(value ?? "").split(/[,;\s]+/);
+	return [...new Set(values.map((entry) => String(entry).trim()).filter(Boolean))];
+}
+
+/** Channels where the bot answers every message without an @mention. */
+export function autoReplyChannels(config) {
+	const channels = normalizeAutoReplyChannels(config?.autoReplyChannels);
+	if (config?.autoReplyEnabled) {
+		const fallback = String(config?.defaultChannelId || "").trim();
+		if (fallback && !channels.includes(fallback)) channels.unshift(fallback);
+	}
+	return channels;
+}
+
+/** Whether a channel is configured for automatic replies. */
+export function isAutoReplyChannel(channelId, config) {
+	const id = String(channelId || "").trim();
+	if (!id) return false;
+	return autoReplyChannels(config).includes(id);
+}
+
+/** The effective Discord core system prompt. */
+export function buildCorePrompt(config) {
+	const stored = String(config?.systemPrompt || "").trim();
+	return stored || DEFAULT_CORE_PROMPT;
+}
+
+/** Append text to the current core system prompt. */
+export function appendCorePrompt(config, text) {
+	const addition = String(text || "").trim();
+	const current = buildCorePrompt(config);
+	if (!addition) return current;
+	return current ? `${current}\n\n${addition}` : addition;
+}
+
+/** Wrap the routed message with the Discord core prompt and optional reply context. */
+export function buildRequestText({ text = "", config = {}, replyContext = "" } = {}) {
+	const body = String(text || "").trim();
+	const parts = [];
+	const prompt = buildCorePrompt(config);
+	if (prompt) {
+		parts.push("<discord_core_prompt>", prompt, "</discord_core_prompt>");
+	}
+	const context = String(replyContext || "").trim();
+	if (context) {
+		parts.push("<discord_reply_context>", context, "</discord_reply_context>");
+	}
+	parts.push("<discord_user_message>", body, "</discord_user_message>");
+	return parts.join("\n");
+}
+
+/** Parse the mutually exclusive `replace` / `append` options of `/system`. */
+export function parseSystemArguments({ replace = "", append = "" } = {}) {
+	const replaceText = String(replace ?? "").trim();
+	const appendText = String(append ?? "").trim();
+	if (replaceText && appendText) {
+		return { error: "The `replace` and `append` options are mutually exclusive — use only one." };
+	}
+	if (replaceText) return { mode: "replace", text: replaceText };
+	if (appendText) return { mode: "append", text: appendText };
+	return { mode: "", text: "" };
+}
+
+/** Parse the plain-text form of `/system replace <text>` / `/system append <text>`. */
+export function parseSystemCommandArgument(argument) {
+	const text = String(argument ?? "").trim();
+	if (!text) return { replace: "", append: "" };
+	const match = /^(replace|append)\s+([\s\S]*)$/i.exec(text);
+	if (!match) return { replace: "", append: "", invalid: text };
+	if (match[1].toLowerCase() === "replace") return { replace: match[2].trim(), append: "" };
+	return { replace: "", append: match[2].trim() };
+}
+
+/** Whether the message explicitly mentions the bot. */
+export function isBotMentioned(message, botId) {
+	const id = String(botId || "").trim();
+	if (!id) return false;
+	const mentions = Array.isArray(message?.mentions) ? message.mentions : [];
+	return mentions.some((user) => String(user?.id || "") === id);
+}
+
+/** Whether the message replies to a message written by the bot. */
+export function isReplyToBotMessage(message, botId, referencedMessage = null) {
+	const id = String(botId || "").trim();
+	if (!id) return false;
+	const reference = referencedMessage || message?.referenced_message || null;
+	const authorId = String(reference?.author?.id || "").trim();
+	return Boolean(authorId) && authorId === id;
+}
+
+/**
+ * Whether an inbound guild message is addressed to the bot.
+ *
+ * A message qualifies when it mentions the bot, replies to the bot, or is sent
+ * in a channel configured for automatic replies.
+ */
+export function isMessageAddressedToBot(message, { botId = "", config = {}, referencedMessage = null } = {}) {
+	if (isBotMentioned(message, botId)) return true;
+	if (isReplyToBotMessage(message, botId, referencedMessage)) return true;
+	return isAutoReplyChannel(message?.channel_id, config);
+}
+
+/** Build the context block for a replied-to Discord message. */
+export function buildReplyContext(referencedMessage, { botId = "", limit = 1500 } = {}) {
+	if (!referencedMessage) return "";
+	const author = referencedMessage?.author || {};
+	const authorId = String(author?.id || "").trim();
+	const isBot = Boolean(author?.bot) || (botId && authorId === String(botId));
+	const displayName = String(author?.global_name || author?.username || "").trim();
+	const who = isBot ? "the bot" : displayName ? `@${displayName}` : authorId ? `user ${authorId}` : "another user";
+	const suffix = !isBot && authorId ? ` (${authorId})` : "";
+	const content = String(referencedMessage?.content || "").trim();
+	const body = content ? content.slice(0, limit) : "(the referenced message has no text content)";
+	return `Replying to ${who}${suffix}:\n${body}`;
+}
+
+/** Extract the newest assistant text from a conversation snapshot. */
+export function extractLastAssistantText(conversation, { since = 0 } = {}) {
+	const messages = Array.isArray(conversation?.messages) ? conversation.messages : [];
+	let lastUserIndex = -1;
+	for (let index = messages.length - 1; index >= 0; index -= 1) {
+		if (String(messages[index]?.role || "") === "user") {
+			lastUserIndex = index;
+			break;
+		}
+	}
+	for (let index = messages.length - 1; index > lastUserIndex; index -= 1) {
+		const message = messages[index];
+		if (String(message?.role || "") !== "assistant") continue;
+		const timestamp = Number(message?.timestamp || 0);
+		if (since && timestamp >= 1e12 && timestamp < since) continue;
+		const text = extractAssistantContent(message);
+		if (text) return text;
+	}
+	return "";
+}
 /** Normalize the configured Discord user allowlist. */
 export function normalizeAllowedUsers(value) {
 	const values = Array.isArray(value) ? value : String(value ?? "").split(/[,;\s]+/);
@@ -358,6 +557,7 @@ export class DiscordBotBridge {
 
 		this.pendingRuns = new Map();
 		this.earlyRuns = new Map();
+		this.runErrors = new Map();
 		this.userConversations = new Map();
 		this.userWorkspaces = new Map(Object.entries(initialUserWorkspaces || {}));
 		this.userGenerations = new Map();
@@ -733,6 +933,13 @@ export class DiscordBotBridge {
 		let args = "";
 		if (name === "cwd") args = interactionOption(interaction, "path");
 		if (name === "model") args = interactionOption(interaction, "model");
+		if (name === "thinking") args = interactionOption(interaction, "level");
+		if (name === "system") {
+			args = {
+				replace: interactionOption(interaction, "replace"),
+				append: interactionOption(interaction, "append"),
+			};
+		}
 
 		try {
 			const content = await this.executeCommand(name, args, { authorId, config });
@@ -802,7 +1009,8 @@ export class DiscordBotBridge {
 
 	async executeCommand(name, args = "", { authorId = "", config = this.getConfig() } = {}) {
 		const command = String(name || "").toLowerCase();
-		const argument = String(args || "").trim();
+		const argument = typeof args === "string" ? String(args || "").trim() : "";
+		const optionPayload = args && typeof args === "object" ? args : {};
 
 		if (command === "help") {
 			return [
@@ -812,10 +1020,17 @@ export class DiscordBotBridge {
 				"- `/status` — show gateway, counters, and command registration status.",
 				"- `/new` — start a fresh conversation.",
 				"- `/clear` — clear the current conversation context (alias of `/new`).",
+				"- `/cancel` — cancel the running task.",
 				"- `/cwd [path]` — show or change the workspace directory.",
 				"- `/model [provider/model]` — show or change the AI model.",
+				"- `/thinking [off|low|medium|high|max]` — show or change the thinking level.",
+				"- `/system` — show the current Discord core system prompt.",
+				"- `/system replace <text>` — replace the core system prompt.",
+				"- `/system append <text>` — append to the core system prompt.",
 				"",
 				"Native slash commands are registered per guild. Plain-text commands remain supported.",
+				"Messages in channels configured for automatic replies reach the bot without an @mention,",
+				"and replying to a message adds that message as context.",
 			].join("\n");
 		}
 
@@ -833,12 +1048,28 @@ export class DiscordBotBridge {
 				`- Guilds with registered commands: ${guilds}`,
 				`- Messages received: ${status.messagesReceived}`,
 				`- Replies sent: ${status.messagesReplied}`,
+				`- Workspace: ${this.resolveWorkspace(authorId, config) || "(host default)"}`,
+				`- Model: ${config.model || "(host default)"}`,
+				`- Thinking level: ${config.thinkingLevel || "(host default)"}`,
+				`- Automatic reply channels: ${autoReplyChannels(config).join(", ") || "none"}`,
+				`- Workspace session reuse: ${config.useWorkspaceSession === false ? "off" : "on"}`,
 			].join("\n");
 		}
 
 		if (command === "new" || command === "clear") {
 			this.resetUserConversation(authorId);
 			return "✨ Conversation context cleared. A fresh session is ready.";
+		}
+
+		if (command === "cancel") {
+			const conversationId = this.activeConversationFor(authorId);
+			if (!conversationId) return "ℹ️ There is no running task to cancel.";
+			for (const run of this.pendingRuns.values()) {
+				if (run.authorId === authorId) run.cancelled = true;
+			}
+			const result = await this.host?.abortRun?.(conversationId);
+			if (result?.ok) return "🛑 Cancelled the running task.";
+			return `❌ Could not cancel the running task: ${result?.error || "the host rejected the abort request."}`;
 		}
 
 		if (command === "cwd") {
@@ -863,13 +1094,12 @@ export class DiscordBotBridge {
 
 		if (command === "model") {
 			if (!argument) {
-				const currentModel = config.model || "(host default)";
-				const currentThinking = config.thinkingLevel || "(host default)";
 				return [
 					"### Current AI configuration",
-					`- Model: \`${currentModel}\``,
-					`- Thinking level: \`${currentThinking}\``,
+					`- Model: \`${config.model || "(host default)"}\``,
+					`- Thinking level: \`${config.thinkingLevel || "(host default)"}\``,
 					"Use `/model provider/model` to change the model.",
+					"Use `/thinking off|low|medium|high|max` to change the thinking level.",
 				].join("\n");
 			}
 			const catalog = await this.getModelCatalog();
@@ -880,7 +1110,127 @@ export class DiscordBotBridge {
 			return `✨ AI model changed to: ${argument}`;
 		}
 
+		if (command === "thinking") {
+			if (!argument) {
+				return [
+					"### Current AI configuration",
+					`- Model: \`${config.model || "(host default)"}\``,
+					`- Thinking level: \`${config.thinkingLevel || "(host default)"}\``,
+					`Use \`/thinking ${THINKING_LEVELS.join("|")}\` to change the thinking level.`,
+				].join("\n");
+			}
+			const raw = argument.toLowerCase();
+			if (["default", "host", "none", "reset"].includes(raw)) {
+				await this.updateConfig({ thinkingLevel: "" });
+				return "✨ Thinking level reset to the host default.";
+			}
+			const level = normalizeThinkingLevel(argument);
+			if (!level) {
+				return `❌ Unknown thinking level: ${argument}\nUse one of: ${THINKING_LEVELS.join(", ")}.`;
+			}
+			await this.updateConfig({ thinkingLevel: level });
+			return `✨ Thinking level changed to: ${level}`;
+		}
+
+		if (command === "system") {
+			const systemOptions = typeof args === "object" && args !== null
+				? { replace: optionPayload.replace || "", append: optionPayload.append || "" }
+				: parseSystemCommandArgument(argument);
+			const invalid = String(systemOptions.invalid || "").trim();
+			if (invalid) {
+				return `❌ Unknown /system option: ${invalid}\nUse \`/system replace <text>\` or \`/system append <text>\`.`;
+			}
+			const parsed = parseSystemArguments(systemOptions);
+			if (parsed.error) return `❌ ${parsed.error}`;
+			if (!parsed.mode) {
+				const mode = config.systemPromptMode || (config.systemPrompt ? "replace" : "default");
+				return [
+					"### Discord core system prompt",
+					`- Mode: ${mode}`,
+					"",
+					buildCorePrompt(config),
+				].join("\n");
+			}
+			if (parsed.mode === "replace") {
+				await this.updateConfig({ systemPrompt: parsed.text, systemPromptMode: "replace" });
+				return "✨ Discord core system prompt replaced.";
+			}
+			await this.updateConfig({
+				systemPrompt: appendCorePrompt(config, parsed.text),
+				systemPromptMode: "append",
+			});
+			return "✨ Discord core system prompt updated.";
+		}
+
 		return null;
+	}
+
+	/** The conversation a user is currently bound to (running run first, then last used). */
+	activeConversationFor(authorId) {
+		for (const run of this.pendingRuns.values()) {
+			if (run.authorId === authorId && run.conversationId) return run.conversationId;
+		}
+		return String(this.userConversations.get(authorId) || "").trim();
+	}
+
+	/**
+	 * Resolve the live pi-web-ui conversation that matches the Discord workspace.
+	 *
+	 * Returning its id lets the host steer that exact session, so Discord and the
+	 * browser share one pi session even while it is open in pi-web-ui.
+	 */
+	async resolveWorkspaceConversation(authorId, config = this.getConfig()) {
+		if (config?.useWorkspaceSession === false) return "";
+		const workspace = this.resolveWorkspace(authorId, config);
+		if (!workspace) return "";
+		const target = resolve(workspace);
+
+		try {
+			const active = await this.host?.getActiveConversation?.({ fallback: "latest-non-subagent" });
+			const activeId = String(active?.conversationId || active?.id || "").trim();
+			const activeCwd = String(active?.cwd || "").trim();
+			if (activeId && activeCwd && resolve(activeCwd) === target) return activeId;
+		} catch {}
+
+		try {
+			const conversations = await this.host?.conversations?.list?.();
+			for (const conversation of Array.isArray(conversations) ? conversations : []) {
+				const id = String(conversation?.id || "").trim();
+				if (!id || id.startsWith("/")) continue;
+				const kind = String(conversation?.kind || "").trim();
+				if (kind && kind !== "running") continue;
+				const cwd = String(conversation?.cwd || "").trim();
+				if (!cwd || resolve(cwd) !== target) continue;
+				return id;
+			}
+		} catch {}
+
+		return "";
+	}
+
+	/** Fetch the message a Discord reply points at, so the agent gets that context. */
+	async resolveReferencedMessage(message, config = this.getConfig()) {
+		const embedded = message?.referenced_message;
+		if (embedded) return embedded;
+		const referenceId = String(message?.message_reference?.message_id || "").trim();
+		if (!referenceId) return null;
+		const channelId = String(message?.message_reference?.channel_id || message?.channel_id || "").trim();
+		if (!channelId) return null;
+		try {
+			return await this.api(config?.botToken, "GET", `/channels/${channelId}/messages/${referenceId}`);
+		} catch (error) {
+			this.log("warn", `Discord reply context lookup failed: ${error?.message || error}`);
+			return null;
+		}
+	}
+
+	/** Remember an assistant-side error so the reply can explain the failure. */
+	noteRunError(conversationId, message) {
+		const text = String(message || "").trim();
+		if (!text) return;
+		this.runErrors.set(conversationId, text);
+		const run = this.pendingRuns.get(conversationId) || this.activeDispatch?.run;
+		if (run) run.lastError = text;
 	}
 
 	async onInboundMessage(message) {
@@ -890,16 +1240,16 @@ export class DiscordBotBridge {
 		const authorId = String(message.author?.id || "").trim();
 		const botId = String(this.botUser?.id || "").trim();
 		const isGuild = Boolean(message.guild_id);
+		const config = this.getConfig();
 
-		if (isGuild && botId) {
-			const mentions = Array.isArray(message.mentions) ? message.mentions : [];
-			if (!mentions.some((user) => String(user?.id || "") === botId)) return;
+		const referencedMessage = await this.resolveReferencedMessage(message, config);
+		if (isGuild && !isMessageAddressedToBot(message, { botId, config, referencedMessage })) {
+			return;
 		}
 
 		const cleanText = extractDiscordText(message, botId);
 		if (!cleanText) return;
 
-		const config = this.getConfig();
 		if (!isAllowedUser(config, authorId)) {
 			await this.api(config.botToken, "POST", `/channels/${channelId}/messages`, {
 				content: "Access denied. Add your Discord User ID to the bot allowlist in pi-web-ui.",
@@ -932,6 +1282,8 @@ export class DiscordBotBridge {
 			finished: false,
 			delivered: false,
 			conversationId: "",
+			stopReason: "",
+			lastError: "",
 			resolveCompletion: null,
 			timeoutTimer: null,
 		};
@@ -940,11 +1292,17 @@ export class DiscordBotBridge {
 		});
 		run.completion = completion;
 
-		const request = { text: cleanText, accountId };
+		const replyContext = buildReplyContext(referencedMessage, { botId });
+		const request = {
+			text: buildRequestText({ text: cleanText, config, replyContext }),
+			accountId,
+		};
 		const workspace = this.resolveWorkspace(authorId, config);
 		if (workspace) request.cwd = workspace;
 		if (config.model) request.model = config.model;
 		if (config.thinkingLevel) request.thinkingLevel = config.thinkingLevel;
+		const sessionTarget = await this.resolveWorkspaceConversation(authorId, config);
+		if (sessionTarget) request.conversationId = sessionTarget;
 
 		await this.enqueueDispatch(run, request);
 	}
@@ -984,7 +1342,11 @@ export class DiscordBotBridge {
 			const dispatched = await this.host.chat(request);
 			const conversationId = String(dispatched?.conversationId || "").trim();
 			const expectedClientId = `plugin:discord:${request.accountId}`;
-			if (dispatched?.clientId && dispatched.clientId !== expectedClientId) {
+			if (
+				!request.conversationId &&
+				dispatched?.clientId &&
+				dispatched.clientId !== expectedClientId
+			) {
 				throw new Error(
 					`pi-web-ui routed the request to ${dispatched.clientId} instead of ${expectedClientId}`,
 				);
@@ -1024,9 +1386,12 @@ export class DiscordBotBridge {
 		if (!conversationId) return;
 
 		if (event.type === "message" && event.message) {
-			const content = extractAssistantContent(event.message);
 			const isAssistant = event.message.role === "assistant" || event.message.author === "assistant";
-			if (!content || !isAssistant) return;
+			if (!isAssistant) return;
+			const errorMessage = String(event.message.errorMessage || "").trim();
+			if (errorMessage) this.noteRunError(conversationId, errorMessage);
+			const content = extractAssistantContent(event.message);
+			if (!content) return;
 
 			let run = this.pendingRuns.get(conversationId);
 			if (!run && this.activeDispatch?.run && !this.activeDispatch.run.finished) {
@@ -1051,8 +1416,10 @@ export class DiscordBotBridge {
 		}
 		if (!run) {
 			this.earlyRuns.delete(conversationId);
+			this.runErrors.delete(conversationId);
 			return;
 		}
+		run.stopReason = String(event?.stopReason || run.stopReason || "");
 		await this.finishRun(run);
 	}
 
@@ -1069,16 +1436,20 @@ export class DiscordBotBridge {
 		} else {
 			this.log("info", `Discord reply skipped for a reset or superseded conversation.`);
 		}
+		this.runErrors.delete(run.conversationId);
 		run.resolveCompletion?.();
 	}
 
 	async deliverRun(run, { timedOut = false } = {}) {
 		if (run.delivered) return;
 		run.delivered = true;
-		const rawText = timedOut ? "⏱️ Task timed out after 10 minutes." : run.accumulatedText;
-		const finalText = stripInternalMarkers(rawText) || "✅ Task completed (no text output).";
-		const chunks = chunkMarkdownText(finalText, DISCORD_MESSAGE_LIMIT);
 		const config = this.getConfig();
+		let rawText = timedOut ? "⏱️ Task timed out after 10 minutes." : run.accumulatedText;
+		if (!timedOut && !stripInternalMarkers(rawText)) {
+			rawText = await this.recoverRunText(run);
+		}
+		const finalText = stripInternalMarkers(rawText) || this.describeEmptyRun(run);
+		const chunks = chunkMarkdownText(finalText, DISCORD_MESSAGE_LIMIT);
 
 		try {
 			for (let index = 0; index < chunks.length; index++) {
@@ -1095,6 +1466,50 @@ export class DiscordBotBridge {
 			this.log("warn", `Discord reply delivery failed: ${this.status.lastError}`);
 		}
 	}
+
+	/** Wait briefly for a late assistant message before giving up on the text. */
+	async waitForRunText(run, timeoutMs = LATE_TEXT_GRACE_MS) {
+		const deadline = Date.now() + timeoutMs;
+		while (Date.now() < deadline) {
+			const text = stripInternalMarkers(run?.accumulatedText || "");
+			if (text) return text;
+			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
+		return stripInternalMarkers(run?.accumulatedText || "");
+	}
+
+	/**
+	 * Recover the assistant text when no `message` event carried it.
+	 *
+	 * The host transcript is the source of truth, so read the finished turn back
+	 * from the conversation instead of reporting an empty completion.
+	 */
+	async recoverRunText(run) {
+		const late = await this.waitForRunText(run);
+		if (late) return late;
+		const conversationId = String(run?.conversationId || "").trim();
+		if (!conversationId) return "";
+		try {
+			const snapshot = await this.host?.conversations?.get?.(conversationId);
+			const text = extractLastAssistantText(snapshot, { since: Number(run?.startedAt || 0) });
+			if (text) return text;
+		} catch (error) {
+			this.log("warn", `Conversation transcript lookup failed: ${error?.message || error}`);
+		}
+		return "";
+	}
+
+	/** Explain a run that finished without any assistant text. */
+	describeEmptyRun(run) {
+		const error = String(run?.lastError || this.runErrors.get(run?.conversationId) || "").trim();
+		if (error) return `⚠️ The task failed: ${error}`;
+		const reason = String(run?.stopReason || "").trim();
+		if (reason && !["stop", "endTurn", "end_turn"].includes(reason)) {
+			return `⚠️ The task finished without text output (stop reason: ${reason}).`;
+		}
+		return "✅ Task completed, but the agent returned no text for this turn.";
+	}
+
 }
 
 /** Activate the plugin in pi-web-ui. */
@@ -1180,6 +1595,7 @@ export default async function activate(host) {
 		const respond = (payload) =>
 			reply({
 				...(payload || {}),
+				...(message?.__rid ? { __rid: message.__rid } : {}),
 				...(message?.requestId ? { requestId: message.requestId } : {}),
 			});
 		try {
@@ -1193,6 +1609,11 @@ export default async function activate(host) {
 							workspace: localConfig.workspace || "",
 							model: localConfig.model || "",
 							thinkingLevel: localConfig.thinkingLevel || "",
+							systemPrompt: localConfig.systemPrompt || "",
+							systemPromptMode: localConfig.systemPromptMode || "",
+							autoReplyEnabled: Boolean(localConfig.autoReplyEnabled),
+							autoReplyChannels: normalizeAutoReplyChannels(localConfig.autoReplyChannels),
+							useWorkspaceSession: localConfig.useWorkspaceSession !== false,
 							botEnabled: Boolean(localConfig.botEnabled),
 							allowedUsers: normalizeAllowedUsers(localConfig.allowedUsers),
 							hasBotToken: Boolean(secrets[SECRET_BOT_TOKEN] || localConfig.botToken),
