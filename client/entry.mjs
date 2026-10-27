@@ -27,7 +27,7 @@ export default {
 						<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px;">
 							<div style="border: 1px solid var(--border); padding: 10px; border-radius: 4px; background: var(--bg);">
 								<div style="color: var(--text-dim); font-size: 11px; margin-bottom: 4px;">Gateway state</div>
-								<div class="discord-metric-state" style="font-size: 14px; font-weight: 600;">⚪ Stopped</div>
+								<div class="discord-metric-state" style="font-size: 14px; font-weight: 600;">⏳ Checking…</div>
 							</div>
 							<div style="border: 1px solid var(--border); padding: 10px; border-radius: 4px; background: var(--bg);">
 								<div style="color: var(--text-dim); font-size: 11px; margin-bottom: 4px;">Bot account</div>
@@ -43,8 +43,9 @@ export default {
 							</div>
 						</div>
 						<div class="discord-metric-commands" style="margin-top: 10px; font-size: 12px; color: var(--text-dim); line-height: 1.5;">
-							Native guild commands: <code>/help</code>, <code>/status</code>, <code>/new</code>, <code>/clear</code>, <code>/cwd</code>, and <code>/model</code>. The <code>/cwd</code> and <code>/model</code> options support autocomplete.
+							Native guild commands: <code>/help</code>, <code>/status</code>, <code>/new</code>, <code>/clear</code>, <code>/cancel</code>, <code>/cwd</code>, <code>/model</code>, <code>/thinking</code>, and <code>/system</code>. The <code>/cwd</code> and <code>/model</code> options support autocomplete.
 						</div>
+						<div class="discord-metric-detail" style="margin-top: 6px; font-size: 12px; color: var(--text-dim); line-height: 1.5;"></div>
 						<div style="margin-top: 8px; font-size: 12px; color: var(--text-dim); line-height: 1.5;">
 							The bot uses Discord's outbound Gateway WebSocket, so no public IP or reverse proxy is required. Each Discord user gets an isolated, persistent pi-web-ui conversation.
 						</div>
@@ -122,6 +123,25 @@ export default {
 										</select>
 									</div>
 								</div>
+								<div style="margin-top: 10px;">
+									<label style="display: block; margin-bottom: 4px; color: var(--text-dim);">💬 Automatic replies</label>
+									<div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
+										<input type="checkbox" id="discord-cfg-auto-reply" class="discord-cfg-auto-reply" style="cursor: pointer;" />
+										<label for="discord-cfg-auto-reply" style="font-size: 12px; cursor: pointer; user-select: none;">Answer every message in the default channel (no @mention needed)</label>
+									</div>
+									<label style="display: block; margin-bottom: 4px; color: var(--text-dim);">Extra automatic-reply channel IDs (comma-separated)</label>
+									<input type="text" class="discord-cfg-auto-reply-channels" placeholder="123456789012345678" style="width: 100%; box-sizing: border-box; padding: 6px 10px; border-radius: 4px; border: 1px solid var(--border); background: var(--bg); color: var(--text);" />
+								</div>
+								<div style="margin-top: 10px;">
+									<label style="display: block; margin-bottom: 4px; color: var(--text-dim);">🧠 Discord core system prompt</label>
+									<textarea class="discord-cfg-system-prompt" rows="3" placeholder="Leave empty to use the built-in core prompt" style="width: 100%; box-sizing: border-box; padding: 8px 10px; border-radius: 4px; border: 1px solid var(--border); background: var(--bg); color: var(--text); resize: vertical; font-family: inherit;"></textarea>
+								</div>
+								<div style="margin-top: 10px;">
+									<div style="display: flex; align-items: center; gap: 8px;">
+										<input type="checkbox" id="discord-cfg-workspace-session" class="discord-cfg-workspace-session" style="cursor: pointer;" />
+										<label for="discord-cfg-workspace-session" style="font-size: 12px; cursor: pointer; user-select: none;">Reuse the pi session open in pi-web-ui for this workspace</label>
+									</div>
+								</div>
 							</div>
 						</div>
 						<div style="padding: 12px 16px; border-top: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; background: var(--bg-elev);">
@@ -154,14 +174,18 @@ export default {
 		const configModel = query(".discord-cfg-model");
 		const configModelBrowse = query(".discord-cfg-model-browse");
 		const configThinking = query(".discord-cfg-thinking");
+		const configAutoReply = query(".discord-cfg-auto-reply");
+		const configAutoReplyChannels = query(".discord-cfg-auto-reply-channels");
+		const configSystemPrompt = query(".discord-cfg-system-prompt");
+		const configWorkspaceSession = query(".discord-cfg-workspace-session");
+
 
 		let currentState = {};
+		let refreshTimer = null;
+		let refreshInFlight = false;
 
-		async function refresh() {
-			const state = await sendHost("get_state");
-			if (!state) return;
-			currentState = state;
-			const bot = state.botStatus || {};
+		function renderGatewayState(state) {
+			const bot = state?.botStatus || {};
 			if (bot.state === "connected") {
 				statusBadge.textContent = "🟢 Connected";
 				statusBadge.style.color = "var(--green, #22c55e)";
@@ -188,6 +212,44 @@ export default {
 			metricSent.textContent = String(bot.messagesReplied || 0);
 		}
 
+		async function refresh() {
+			if (refreshInFlight) return;
+			refreshInFlight = true;
+			try {
+				const state = await sendHost("get_state");
+				if (!state) throw new Error("The plugin host returned no state.");
+				currentState = state;
+				renderGatewayState(state);
+				const detail = query(".discord-metric-detail");
+				if (detail) {
+					const config = state.config || {};
+					const channels = Array.isArray(config.autoReplyChannels) ? config.autoReplyChannels : [];
+					const automatic = channels.length
+						? channels.join(", ")
+						: config.autoReplyEnabled
+							? config.defaultChannelId || "none"
+							: "none";
+					detail.textContent = [
+						`Workspace: ${config.workspace || state.hostCwd || "(host default)"}`,
+						`Model: ${config.model || "(host default)"}`,
+						`Thinking: ${config.thinkingLevel || "(host default)"}`,
+						`Core prompt: ${config.systemPrompt ? config.systemPromptMode || "replace" : "built-in"}`,
+						`Automatic reply channels: ${automatic}`,
+						`Workspace session reuse: ${config.useWorkspaceSession === false ? "off" : "on"}`,
+					].join(" · ");
+				}
+			} catch (error) {
+				statusBadge.textContent = "⚠️ Unreachable";
+				statusBadge.style.color = "var(--red, #ef4444)";
+				metricState.textContent = "⚠️ Host unreachable";
+				metricState.style.color = "var(--red, #ef4444)";
+				const detail = query(".discord-metric-detail");
+				if (detail) detail.textContent = `Last error: ${error?.message || String(error)}`;
+			} finally {
+				refreshInFlight = false;
+			}
+		}
+
 		query(".discord-btn-config").addEventListener("click", () => {
 			const config = currentState.config || {};
 			configToken.value = "";
@@ -202,6 +264,13 @@ export default {
 			configWorkspace.value = config.workspace || "";
 			configModel.value = config.model || "";
 			configThinking.value = config.thinkingLevel || "";
+			configAutoReply.checked = Boolean(config.autoReplyEnabled);
+			configAutoReplyChannels.value = Array.isArray(config.autoReplyChannels)
+				? config.autoReplyChannels.join(", ")
+				: "";
+			configSystemPrompt.value = config.systemPrompt || "";
+			configWorkspaceSession.checked = config.useWorkspaceSession !== false;
+
 
 			try {
 				const projects = globalThis.window?.__piWebUiHost?.listProjects?.() || [];
@@ -271,6 +340,14 @@ export default {
 				workspace: configWorkspace.value.trim(),
 				model: configModel.value.trim(),
 				thinkingLevel: configThinking.value,
+				autoReplyEnabled: Boolean(configAutoReply.checked),
+				autoReplyChannels: configAutoReplyChannels.value
+					.split(/[,，;\s]+/)
+					.map((value) => value.trim())
+					.filter(Boolean),
+				systemPrompt: configSystemPrompt.value.trim(),
+				systemPromptMode: configSystemPrompt.value.trim() ? "replace" : "",
+				useWorkspaceSession: Boolean(configWorkspaceSession.checked),
 			};
 			const result = await sendHost("save_config", { config });
 			button.disabled = false;
@@ -318,6 +395,12 @@ export default {
 		});
 
 		await refresh();
-		return () => hostBridge.dispose();
+		refreshTimer = globalThis.setInterval?.(() => {
+			void refresh();
+		}, 4000) || null;
+		return () => {
+			if (refreshTimer) globalThis.clearInterval(refreshTimer);
+			hostBridge.dispose();
+		};
 	},
 };

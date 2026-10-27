@@ -2,8 +2,9 @@
  * Correlate fire-and-forget plugin host messages with their responses.
  *
  * pi-web-ui's client `context.send()` only transmits a message; replies arrive
- * asynchronously through `context.onData()`. This bridge adds request IDs,
- * timeouts, and deterministic cleanup so UI actions can await real results.
+ * asynchronously through `context.onData()`. Bundled pi-web-ui plugins pair
+ * those replies with a `__rid` token, while some builds echo `requestId`, so
+ * this bridge sends both tokens and accepts either one on the way back.
  */
 export function createHostRequestBridge(context, { timeoutMs = 15_000 } = {}) {
 	if (typeof context?.send !== "function" || typeof context?.onData !== "function") {
@@ -14,7 +15,7 @@ export function createHostRequestBridge(context, { timeoutMs = 15_000 } = {}) {
 	let sequence = 0;
 
 	const unsubscribe = context.onData((payload) => {
-		const requestId = String(payload?.requestId || "").trim();
+		const requestId = String(payload?.__rid || payload?.requestId || "").trim();
 		if (!requestId) return;
 		const waiter = pending.get(requestId);
 		if (!waiter) return;
@@ -36,7 +37,7 @@ export function createHostRequestBridge(context, { timeoutMs = 15_000 } = {}) {
 			}, timeoutMs);
 			pending.set(requestId, { resolve, reject, timer });
 			try {
-				context.send({ ...payload, type, requestId });
+				context.send({ ...payload, type, __rid: requestId, requestId });
 			} catch (error) {
 				pending.delete(requestId);
 				clearTimeout(timer);
