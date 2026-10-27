@@ -115,8 +115,15 @@ is scoped to Discord turns and stored in the same plugin configuration as worksp
 thinking level.
 
 **Reply robustness.** A finished turn reads its answer back from the host transcript when no assistant
-message event carried the text, and reports the real error when the model failed. The bot no longer
-answers "no text output" for a turn that has an answer in the session file.
+message event carried the text: the plugin asks the host for the conversation snapshot and, for
+headless runs, for the snapshot of its own pseudo client. The real error is reported when the model
+failed, so the bot no longer answers "no text output" for a turn that has an answer in the session
+file.
+
+**Turn isolation.** A shared workspace session also runs the browser tab's turns. The plugin only
+collects output that belongs to the turn it dispatched: events older than the dispatch are ignored and
+the text collected before the Discord turn began is dropped when that turn starts. A `run_end` that
+belongs to the browser tab therefore does not end the Discord reply.
 
 ## Session isolation and reset behavior
 
