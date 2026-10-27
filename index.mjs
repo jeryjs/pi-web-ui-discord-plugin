@@ -151,13 +151,30 @@ export const DISCORD_COMMANDS = Object.freeze([
 		]),
 	}),
 	Object.freeze({
+		name: "context",
+		description: "Show or clear the Discord context loaded with /read",
+		type: 1,
+		options: Object.freeze([
+			Object.freeze({
+				name: "action",
+				description: "What to do with the loaded context (default show)",
+				type: 3,
+				required: false,
+				choices: Object.freeze([
+					Object.freeze({ name: "show", value: "show" }),
+					Object.freeze({ name: "clear", value: "clear" }),
+				]),
+			}),
+		]),
+	}),
+	Object.freeze({
 		name: "read",
-		description: "Read the last messages in this channel",
+		description: "Load the last messages of this channel into the chat context",
 		type: 1,
 		options: Object.freeze([
 			Object.freeze({
 				name: "count",
-				description: `How many messages to read (1-${DISCORD_READ_MAX_COUNT}, default ${DISCORD_READ_DEFAULT_COUNT})`,
+				description: `How many messages to load (1-${DISCORD_READ_MAX_COUNT}, default ${DISCORD_READ_DEFAULT_COUNT})`,
 				type: 4,
 				required: false,
 				min_value: 1,
@@ -281,7 +298,8 @@ export function parseLegacyCommand(text) {
  * Default Discord core system prompt.
  *
  * The plugin API cannot change pi-web-ui's host-wide system prompt, so Discord
- * runs get their own core prompt that is prepended to every routed message.
+ * runs get their own core prompt. It is stated once at the start of a
+ * conversation and then lives in the transcript.
  */
 export const DEFAULT_CORE_PROMPT = [
 	"You are Nero, the pi-web-ui coding agent assistant connected to Discord.",
@@ -333,17 +351,27 @@ export function appendCorePrompt(config, text) {
 	return current ? `${current}\n\n${addition}` : addition;
 }
 
-/** Wrap the routed message with the Discord core prompt and optional reply context. */
-export function buildRequestText({ text = "", config = {}, replyContext = "" } = {}) {
+/**
+ * Wrap the routed message with the Discord core prompt and optional context.
+ *
+ * The core prompt is a conversation-level instruction: it is stated once and
+ * then lives in the transcript, instead of being repeated in every turn. The
+ * loaded context (from `/read`) is carried by every turn until it is cleared.
+ */
+export function buildRequestText({ text = "", config = {}, replyContext = "", loadedContext = "", includeCorePrompt = true } = {}) {
 	const body = String(text || "").trim();
 	const parts = [];
 	const prompt = buildCorePrompt(config);
-	if (prompt) {
+	if (prompt && includeCorePrompt) {
 		parts.push("<discord_core_prompt>", prompt, "</discord_core_prompt>");
 	}
 	const context = String(replyContext || "").trim();
 	if (context) {
 		parts.push("<discord_reply_context>", context, "</discord_reply_context>");
+	}
+	const loaded = String(loadedContext || "").trim();
+	if (loaded) {
+		parts.push("<discord_context>", loaded, "</discord_context>");
 	}
 	parts.push("<discord_user_message>", body, "</discord_user_message>");
 	return parts.join("\n");
@@ -471,6 +499,50 @@ export function formatChannelTranscript(messages, { botId = "", messageLimit = 5
 		rows.push(`- ${isBot ? "the bot" : `@${name}`}${when ? ` · ${when}` : ""}: ${body}`);
 	}
 	return rows;
+}
+
+/** Normalize a Discord message into a storable context entry. */
+export function normalizeLoadedMessage(message, botId = "") {
+	const author = message?.author || {};
+	const authorId = String(author?.id || "").trim();
+	return {
+		authorId,
+		authorName: String(author?.global_name || author?.username || "").trim(),
+		isBot: Boolean(author?.bot) || (botId && authorId === String(botId)),
+		content: String(message?.content || "").trim(),
+		timestamp: String(message?.timestamp || "").trim(),
+	};
+}
+
+/**
+ * Format the batches loaded with `/read` into a context block.
+ *
+ * Each batch is one channel read earlier; the block is rendered oldest-first
+ * so the agent reads the conversations in the order they were loaded.
+ */
+export function formatLoadedContext(batches, { botId = "", messageLimit = 1000 } = {}) {
+	const list = Array.isArray(batches) ? batches : [];
+	const blocks = [];
+	for (const batch of list) {
+		const messages = Array.isArray(batch?.messages) ? batch.messages : [];
+		if (!messages.length) continue;
+		const where = String(batch?.channelName || batch?.channelId || "a Discord channel").trim();
+		const rows = [];
+		for (const message of messages) {
+			const content = String(message?.content || "").trim();
+			if (!content) continue;
+			const authorId = String(message?.authorId || "").trim();
+			const isBot = Boolean(message?.isBot) || (botId && authorId === String(botId));
+			const name = String(message?.authorName || "").trim();
+			const who = isBot ? "the bot" : name ? `@${name}` : authorId ? `user ${authorId}` : "someone";
+			const body = content.length > messageLimit ? `${content.slice(0, messageLimit)}…` : content;
+			rows.push(`${who}: ${body}`);
+		}
+		if (!rows.length) continue;
+		blocks.push([`Messages loaded from ${where}:`, ...rows.map((row) => `- ${row}`)].join("\n"));
+	}
+	if (!blocks.length) return "";
+	return ["Context loaded from Discord with /read:", ...blocks.map((block) => `\n${block}`)].join("\n");
 }
 
 /** Extract the newest assistant text from a conversation snapshot. */
@@ -678,6 +750,8 @@ export class DiscordBotBridge {
 		updateConfig,
 		persistUserWorkspaces,
 		initialUserWorkspaces,
+		persistUserContexts,
+		initialUserContexts,
 		log,
 		api,
 		fsImpl,
@@ -687,6 +761,7 @@ export class DiscordBotBridge {
 		this.getConfig = getConfig || (() => ({}));
 		this.updateConfig = updateConfig || (async () => {});
 		this.persistUserWorkspaces = persistUserWorkspaces || (async () => {});
+		this.persistUserContexts = persistUserContexts || (async () => {});
 		this.log = log || ((level, message) => console.log(`[discord-bot:${level}] ${message}`));
 		this.api = api || discordApi;
 		this.fs = fsImpl || { readdir: fsReaddir, stat: fsStat };
@@ -707,6 +782,8 @@ export class DiscordBotBridge {
 		this.runErrors = new Map();
 		this.userConversations = new Map();
 		this.userWorkspaces = new Map(Object.entries(initialUserWorkspaces || {}));
+		this.userContexts = new Map(Object.entries(initialUserContexts || {}));
+		this.corePromptGenerations = new Map();
 		this.userGenerations = new Map();
 		this.knownGuilds = new Set();
 		this.registeredGuilds = new Set();
@@ -744,6 +821,59 @@ export class DiscordBotBridge {
 		};
 	}
 
+	/** The batches loaded with `/read` for one user, oldest load first. */
+	loadedBatches(authorId, { excludeChannelId = "" } = {}) {
+		const store = this.userContexts.get(authorId) || {};
+		return Object.entries(store)
+			.filter(([channelId]) => channelId !== excludeChannelId)
+			.map(([channelId, batch]) => ({ channelId, ...(batch || {}) }))
+			.sort((a, b) => Number(a.loadedAt || 0) - Number(b.loadedAt || 0));
+	}
+
+	/** The plain object persisted in the plugin storage. */
+	serializedUserContexts() {
+		return Object.fromEntries(this.userContexts.entries());
+	}
+
+	/**
+	 * Store the messages of one channel as the user's loaded context.
+	 *
+	 * Re-reading the same channel replaces its batch, so the context never
+	 * grows with repeated `/read` calls in the same place.
+	 */
+	async loadChannelContext(authorId, channelId, channelName, messages) {
+		const store = { ...(this.userContexts.get(authorId) || {}) };
+		store[channelId] = {
+			channelId,
+			channelName: String(channelName || channelId || "").trim(),
+			loadedAt: Date.now(),
+			messages: (Array.isArray(messages) ? messages : []).filter((message) => message?.content),
+		};
+		this.userContexts.set(authorId, store);
+		await this.persistUserContexts(this.serializedUserContexts());
+		return store[channelId];
+	}
+
+	/** Drop the loaded context of one user. */
+	async clearUserContext(authorId) {
+		this.userContexts.delete(authorId);
+		await this.persistUserContexts(this.serializedUserContexts());
+	}
+
+	/**
+	 * Whether the Discord core prompt still has to be stated.
+	 *
+	 * It is a conversation-level instruction, so it is injected once per
+	 * conversation and then stays in the transcript, instead of being repeated
+	 * in every single turn.
+	 */
+	shouldInjectCorePrompt(authorId) {
+		const generation = Number(this.userGenerations.get(authorId) || 0);
+		if (this.corePromptGenerations.get(authorId) === generation) return false;
+		this.corePromptGenerations.set(authorId, generation);
+		return true;
+	}
+
 	resolveWorkspace(authorId, config = this.getConfig()) {
 		return String(this.userWorkspaces.get(authorId) || config?.workspace || this.host?.cwd || "").trim();
 	}
@@ -760,6 +890,9 @@ export class DiscordBotBridge {
 		const generation = Number(this.userGenerations.get(authorId) || 0) + 1;
 		this.userGenerations.set(authorId, generation);
 		this.userConversations.delete(authorId);
+		// A fresh conversation starts without the context loaded with /read.
+		this.userContexts.delete(authorId);
+		void this.persistUserContexts(this.serializedUserContexts());
 		for (const run of this.pendingRuns.values()) {
 			if (run.authorId === authorId) run.cancelled = true;
 		}
@@ -1180,6 +1313,10 @@ export class DiscordBotBridge {
 			await this.handleReadCommand(interaction, { authorId, config });
 			return;
 		}
+		if (name === "context") {
+			await this.handleContextCommand(interaction, { authorId });
+			return;
+		}
 
 		let deferred = false;
 		try {
@@ -1268,7 +1405,11 @@ export class DiscordBotBridge {
 	}
 
 	/**
-	 * Handle `/read` — show the most recent messages of the current channel.
+	 * Handle `/read` — load the most recent messages of the current channel
+	 * into the chat context.
+	 *
+	 * No agent turn is triggered: the messages are stored and carried by the
+	 * next prompt, wherever that prompt is sent from.
 	 */
 	async handleReadCommand(interaction, { authorId = "", config = this.getConfig() } = {}) {
 		const channelId = String(interaction?.channel_id || "").trim();
@@ -1286,9 +1427,67 @@ export class DiscordBotBridge {
 			await this.sendInteractionContent(interaction, "📭 No messages found in this channel.");
 			return;
 		}
-		const rows = formatChannelTranscript(result.messages, { botId: String(this.botUser?.id || "") });
-		const header = `### Last ${result.messages.length} message${result.messages.length === 1 ? "" : "s"} in this channel`;
-		await this.sendInteractionContent(interaction, [header, "", ...rows].join("\n"));
+
+		const botId = String(this.botUser?.id || "");
+		const batch = await this.loadChannelContext(
+			authorId,
+			channelId,
+			await this.resolveChannelName(channelId, config),
+			result.messages.map((message) => normalizeLoadedMessage(message, botId)),
+		);
+
+		const total = this.loadedBatches(authorId).reduce((sum, entry) => sum + entry.messages.length, 0);
+		const count = batch.messages.length;
+		const lines = [
+			`✅ **${count} message${count === 1 ? "" : "s"} loaded into the chat context.**`,
+			total > count ? `The chat context now holds ${total} messages in total.` : "",
+			"- No agent turn was triggered.",
+			"- The next prompt you send will include them, in this or any other channel.",
+			"- Use `/context clear` to drop the loaded context.",
+		];
+		await this.sendInteractionContent(interaction, lines.filter(Boolean).join("\n"), {
+			flags: DISCORD_EPHEMERAL_FLAG,
+		});
+	}
+
+	/**
+	 * Handle `/context` — show or clear the context loaded with `/read`.
+	 */
+	async handleContextCommand(interaction, { authorId = "" } = {}) {
+		const action = (interactionOption(interaction, "action") || "show").toLowerCase();
+		if (action === "clear") {
+			await this.clearUserContext(authorId);
+			await this.sendInteractionContent(interaction, "🧹 Chat context cleared.", { flags: DISCORD_EPHEMERAL_FLAG });
+			return;
+		}
+		const batches = this.loadedBatches(authorId);
+		if (!batches.length) {
+			await this.sendInteractionContent(
+				interaction,
+				"📭 No Discord context is loaded. Use `/read [count]` in a channel to load it.",
+				{ flags: DISCORD_EPHEMERAL_FLAG },
+			);
+			return;
+		}
+		const lines = ["### Loaded chat context", ""];
+		for (const batch of batches) {
+			lines.push(`- **${batch.channelName || batch.channelId}** — ${batch.messages.length} message${batch.messages.length === 1 ? "" : "s"}`);
+		}
+		lines.push("", "Use `/context clear` to drop it.");
+		await this.sendInteractionContent(interaction, lines.join("\n"), { flags: DISCORD_EPHEMERAL_FLAG });
+	}
+
+	/** Best-effort channel name, used to label the loaded context. */
+	async resolveChannelName(channelId, config = this.getConfig()) {
+		const channel = String(channelId || "").trim();
+		if (!channel) return "";
+		try {
+			const data = await this.api(config?.botToken, "GET", `/channels/${channel}`);
+			const name = String(data?.name || "").trim();
+			return name ? `#${name}` : channel;
+		} catch {
+			return channel;
+		}
 	}
 
 	/**
@@ -1338,7 +1537,15 @@ export class DiscordBotBridge {
 		this.status.lastMessageAt = Date.now();
 
 		const run = this.createRun({ channelId, authorId, interaction: deferred ? interaction : null });
-		const request = await this.buildRequest({ text: prompt, config, replyContext: context.text, authorId });
+		const request = await this.buildRequest({
+			text: prompt,
+			config,
+			replyContext: context.text,
+			authorId,
+			// /pi already reads this channel itself, so the loaded batch of the
+			// same channel is skipped to avoid repeating the same messages.
+			excludeContextChannelId: channelId,
+		});
 		await this.enqueueDispatch(run, request);
 	}
 
@@ -1405,7 +1612,9 @@ export class DiscordBotBridge {
 				"- `/system` — show the current Discord core system prompt.",
 				"- `/system replace <text>` — replace the core system prompt.",
 				"- `/system append <text>` — append to the core system prompt.",
-				"- `/read [count]` — read the last messages in this channel (default 5).",
+				"- `/read [count]` — load the last messages of this channel into the chat context (default 5).",
+				"- `/context` — show the context loaded with `/read`.",
+				"- `/context clear` — drop the loaded context.",
 				"- `/pi <message> [context]` — send a prompt to the agent, like @pi but usable in DMs.",
 				"- `pi-message` — right-click a message → Apps → pi-message, to use it as the prompt.",
 				"",
@@ -1414,6 +1623,7 @@ export class DiscordBotBridge {
 				"Plain-text commands remain supported.",
 				"Messages in channels configured for automatic replies reach the bot without an @mention,",
 				"and replying to a message adds that message as context.",
+				"The context loaded with `/read` is carried by every later prompt until it is cleared.",
 			].join("\n");
 		}
 
@@ -1704,10 +1914,27 @@ export class DiscordBotBridge {
 	}
 
 	/** Build the pi-web-ui request for one agent turn. */
-	async buildRequest({ text = "", config = {}, replyContext = "", authorId = "" } = {}) {
+	async buildRequest({
+		text = "",
+		config = {},
+		replyContext = "",
+		authorId = "",
+		excludeContextChannelId = "",
+	} = {}) {
 		const accountId = this.userAccountId(authorId);
+		const botId = String(this.botUser?.id || "");
+		const loadedContext = formatLoadedContext(
+			this.loadedBatches(authorId, { excludeChannelId: excludeContextChannelId }),
+			{ botId },
+		);
 		const request = {
-			text: buildRequestText({ text, config, replyContext }),
+			text: buildRequestText({
+				text,
+				config,
+				replyContext,
+				loadedContext,
+				includeCorePrompt: this.shouldInjectCorePrompt(authorId),
+			}),
 			accountId,
 		};
 		const workspace = this.resolveWorkspace(authorId, config);
@@ -1728,21 +1955,53 @@ export class DiscordBotBridge {
 			if (parsed.name === "read") {
 				const count = normalizeReadCount(parsed.args, DISCORD_READ_DEFAULT_COUNT);
 				const result = await this.fetchChannelMessages(channelId, count, config);
-				const content = result.error
-					? this.historyUnavailableMessage(result.error)
-					: result.messages.length
-						? [
-								`### Last ${result.messages.length} message${result.messages.length === 1 ? "" : "s"} in this channel`,
-								"",
-								...formatChannelTranscript(result.messages, { botId: String(this.botUser?.id || "") }),
-							].join("\n")
-						: "📭 No messages found in this channel.";
-				for (const chunk of chunkMarkdownText(content, DISCORD_MESSAGE_LIMIT)) {
-					await this.api(config.botToken, "POST", `/channels/${channelId}/messages`, {
-						content: chunk,
-						message_reference: replyToId ? { message_id: replyToId } : undefined,
-					});
+				if (result.error) {
+					await this.postChannelText(channelId, config, this.historyUnavailableMessage(result.error), replyToId);
+					return true;
 				}
+				if (!result.messages.length) {
+					await this.postChannelText(channelId, config, "📭 No messages found in this channel.", replyToId);
+					return true;
+				}
+				const botId = String(this.botUser?.id || "");
+				const batch = await this.loadChannelContext(
+					authorId,
+					channelId,
+					await this.resolveChannelName(channelId, config),
+					result.messages.map((message) => normalizeLoadedMessage(message, botId)),
+				);
+				const count2 = batch.messages.length;
+				await this.postChannelText(
+					channelId,
+					config,
+					[
+						`✅ **${count2} message${count2 === 1 ? "" : "s"} loaded into the chat context.**`,
+						"- No agent turn was triggered.",
+						"- The next prompt you send will include them, in this or any other channel.",
+						"- Use `/context clear` to drop the loaded context.",
+					].join("\n"),
+					replyToId,
+				);
+				return true;
+			}
+			if (parsed.name === "context") {
+				const action = (parsed.args || "show").toLowerCase();
+				if (action === "clear") {
+					await this.clearUserContext(authorId);
+					await this.postChannelText(channelId, config, "🧹 Chat context cleared.", replyToId);
+					return true;
+				}
+				const batches = this.loadedBatches(authorId);
+				const lines = batches.length
+					? [
+							"### Loaded chat context",
+							"",
+							...batches.map((batch) => `- **${batch.channelName || batch.channelId}** — ${batch.messages.length} message${batch.messages.length === 1 ? "" : "s"}`),
+							"",
+							"Use `/context clear` to drop it.",
+						].join("\n")
+					: "📭 No Discord context is loaded. Use `/read [count]` in a channel to load it.";
+				await this.postChannelText(channelId, config, lines, replyToId);
 				return true;
 			}
 			const content = await this.executeCommand(parsed.name, parsed.args, { authorId, config });
@@ -1758,6 +2017,20 @@ export class DiscordBotBridge {
 				message_reference: replyToId ? { message_id: replyToId } : undefined,
 			}).catch(() => {});
 			return true;
+		}
+	}
+
+	/**
+	 * Post a text message to a channel, optionally as a reply.
+	 *
+	 * Long text is split so nothing is silently truncated.
+	 */
+	async postChannelText(channelId, config = this.getConfig(), content = "", replyToId = "") {
+		for (const chunk of chunkMarkdownText(content, DISCORD_MESSAGE_LIMIT)) {
+			await this.api(config?.botToken, "POST", `/channels/${channelId}/messages`, {
+				content: chunk,
+				message_reference: replyToId ? { message_id: replyToId } : undefined,
+			});
 		}
 	}
 
@@ -2096,6 +2369,7 @@ export default async function activate(host) {
 	localConfig = mergeSavedSecrets(localConfig, {}, savedSecrets);
 
 	const initialUserWorkspaces = (await host.storage.get("userWorkspaces")) || {};
+	const initialUserContexts = (await host.storage.get("userContexts")) || {};
 	const bridge = new DiscordBotBridge({
 		host,
 		getConfig: () => localConfig,
@@ -2106,7 +2380,11 @@ export default async function activate(host) {
 		persistUserWorkspaces: async (workspaces) => {
 			await host.storage.set("userWorkspaces", workspaces || {});
 		},
+		persistUserContexts: async (contexts) => {
+			await host.storage.set("userContexts", contexts || {});
+		},
 		initialUserWorkspaces,
+		initialUserContexts,
 		log: (level, message) => host.log?.(level, message),
 	});
 

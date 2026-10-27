@@ -69,9 +69,21 @@ To install under a different plugin ID, omit `--name discord`. The Discord bot p
 | Clear session | `/clear` | `/clear` | Alias of `/new`. |
 | Workspace | `/cwd [path]` | `/cwd [path]`, `/workspace [path]` | Shows or changes the workspace. Changing it also starts a fresh session. |
 | Model | `/model [provider/model]` | `/model [provider/model]` | Shows or changes the model used for subsequent Discord prompts. |
-| Read | `/read [count]` | `/read [count]` | Shows the last `count` messages of the current channel (default 5). |
+| Read | `/read [count]` | `/read [count]` | Loads the last `count` messages of the current channel (default 5) into the chat context. No agent turn is triggered. |
+| Context | `/context [show\|clear]` | `/context [show\|clear]` | Shows the context loaded with `/read`, or drops it with `clear`. |
 | Prompt | `/pi <message> [context]` | `/pi <message>` | Sends a prompt to the pi agent through the same pipeline as an @mention. The optional `context` option sets how many recent channel messages are included (default 5). |
 | Message prompt | `pi-message` (message context menu) | — | Uses the message you right-clicked as the prompt. This is the only way to hand a message to a user-installed app in a third-party DM, where channel history is not readable. |
+
+### Loaded chat context
+
+`/read` does not answer anything by itself: it stores the messages it fetched and confirms with a
+short, dismissable (ephemeral) reply. The stored messages are then carried by **every later
+prompt** — in any channel or DM — until the context is dropped with `/context clear` or the
+conversation is reset with `/new`, `/clear`, or `/cwd`. Re-reading the same channel replaces that
+channel's batch instead of piling up duplicates.
+
+Because the context belongs to the conversation, it is cleared together with it: `/new`, `/clear`,
+and a `/cwd` change all start from an empty context.
 
 `/cwd` and `/model` use Discord autocomplete. Plain-text commands in a guild must mention the bot (for example, `@Nero /status`); direct messages do not require a mention, and channels listed under `autoReplyChannels` (plus the default channel when `autoReplyEnabled` is on) accept every message without a mention.
 
@@ -120,10 +132,14 @@ the bot's own messages always reaches the bot, even outside those channels.
 embeds it when the bot has it cached) and passed to the agent inside a `<discord_reply_context>` block
 together with the author, so "what about this?" carries the quoted message.
 
-**Core system prompt.** `/system` manages the prompt that is prepended to every Discord-routed
-message. The plugin API cannot change pi-web-ui's host-wide system prompt, so the Discord core prompt
-is scoped to Discord turns and stored in the same plugin configuration as workspace, model, and
-thinking level.
+**Core system prompt.** `/system` manages the prompt that identifies the Discord core prompt. The
+plugin API cannot change pi-web-ui's host-wide system prompt (the `{{soul}}` template section is
+host-global, and pi-web-ui applies `promptOverrides` globally rather than per conversation), so the
+Discord core prompt is scoped to Discord turns and stored in the same plugin configuration as
+workspace, model, and thinking level. It is stated **once per conversation**: the first turn of a
+conversation carries it in a `<discord_core_prompt>` block, and it then stays in the transcript
+instead of being repeated in every turn. `/new`, `/clear`, and a `/cwd` change start a new
+conversation, which states it again.
 
 **Reply robustness.** A finished turn reads its answer back from the host transcript when no assistant
 message event carried the text: the plugin asks the host for the conversation snapshot and, for
