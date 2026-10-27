@@ -14,7 +14,7 @@ import { chunkMarkdownText } from "./markdown-chunks.mjs";
 export const SECRET_BOT_TOKEN = "discord.botToken";
 
 export const DISCORD_API_BASE = "https://discord.com/api/v10";
-export const PLUGIN_VERSION = "1.2.0";
+export const PLUGIN_VERSION = "1.2.1";
 
 export const DISCORD_INTENTS = Object.freeze({
 	GUILDS: 1 << 0,
@@ -155,11 +155,23 @@ export const DISCORD_COMMANDS = Object.freeze([
  */
 export const DISCORD_COMMAND_INTEGRATION_TYPES = Object.freeze([0, 1]);
 
+/**
+ * Interaction contexts supported by every native command.
+ *
+ * Discord only applies its "all contexts" default to newly created commands, so
+ * commands registered without an explicit `contexts` keep `contexts: null` and
+ * stay invisible outside guilds and the app's own DM. Setting `[0, 1, 2]`
+ * explicitly is required for the commands to appear in DMs and GDMs with other
+ * users (PRIVATE_CHANNEL) for user-installed apps.
+ */
+export const DISCORD_COMMAND_CONTEXTS = Object.freeze([0, 1, 2]);
+
 /** Build the command payload sent to the Discord application command endpoints. */
 export function buildCommandPayload() {
 	return DISCORD_COMMANDS.map((command) => ({
 		...command,
 		integration_types: [...DISCORD_COMMAND_INTEGRATION_TYPES],
+		contexts: [...DISCORD_COMMAND_CONTEXTS],
 	}));
 }
 
@@ -951,10 +963,16 @@ export class DiscordBotBridge {
 		);
 	}
 
-	/** Omit the ephemeral flag for DM/private-channel interactions so user-installed-app responses are visible there. */
+	/**
+	 * Whether an interaction response should be ephemeral.
+	 *
+	 * Only the app's own DM (BOT_DM) can carry a public reply. A user-installed
+	 * app has no bot presence in a third-party DM or GDM, so PRIVATE_CHANNEL
+	 * responses must stay ephemeral or delivery fails.
+	 */
 	interactionFlags(interaction) {
 		const context = Number(interaction?.context ?? 0);
-		return context === INTERACTION_CONTEXT.GUILD ? DISCORD_EPHEMERAL_FLAG : undefined;
+		return context === INTERACTION_CONTEXT.BOT_DM ? undefined : DISCORD_EPHEMERAL_FLAG;
 	}
 
 	async deferInteraction(interaction) {

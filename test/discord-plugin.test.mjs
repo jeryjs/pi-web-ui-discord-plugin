@@ -342,6 +342,7 @@ test("global commands are registered so user-installed apps can use them in DMs"
 	]);
 	for (const command of global.payload) {
 		assert.deepEqual(command.integration_types, [0, 1]);
+		assert.deepEqual(command.contexts, [0, 1, 2]);
 	}
 	assert.equal(harness.bridge.status.registeredGlobally, true);
 
@@ -354,7 +355,7 @@ test("global commands are registered so user-installed apps can use them in DMs"
 	);
 });
 
-test("command responses stay ephemeral in guilds but visible in DMs", async () => {
+test("command responses stay ephemeral outside the app's own DM", async () => {
 	const harness = createHarness({ models: [{ id: "openai/gpt-5" }] });
 
 	await harness.bridge.handleInteraction({
@@ -381,6 +382,18 @@ test("command responses stay ephemeral in guilds but visible in DMs", async () =
 	const dmResponse = harness.apiCalls.at(-1);
 	assert.equal(dmResponse.path, "/interactions/dm-interaction/interaction-token/callback");
 	assert.equal(dmResponse.payload.data.flags, undefined);
+
+	await harness.bridge.handleInteraction({
+		id: "private-channel-interaction",
+		token: "interaction-token",
+		type: INTERACTION_TYPE.APPLICATION_COMMAND,
+		user: { id: AUTHOR_ID },
+		context: 2,
+		data: { name: "help", options: [] },
+	});
+	const privateResponse = harness.apiCalls.at(-1);
+	assert.equal(privateResponse.path, "/interactions/private-channel-interaction/interaction-token/callback");
+	assert.equal(privateResponse.payload.data.flags, 64);
 });
 
 test("native interactions answer ping, command, and autocomplete callbacks", async () => {
