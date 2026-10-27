@@ -698,6 +698,37 @@ test("the Discord core prompt is stated once per conversation, not on every turn
 	assert.match(harness.chatCalls[2].text, /<discord_core_prompt>/);
 });
 
+test("the plain-text /read and /context commands load and drop the context", async () => {
+	const harness = createHarness();
+	harness.bridge.api = async (token, method, path, payload) => {
+		harness.apiCalls.push({ token, method, path, payload });
+		if (method === "GET" && path.startsWith(`/channels/${CHANNEL_ID}/messages`)) {
+			return [{ id: "m1", content: "the loaded line", author: { id: "user-a", username: "ay" } }];
+		}
+		if (method === "GET") return { id: CHANNEL_ID, name: "general" };
+		return { id: "message-1" };
+	};
+
+	await harness.bridge.onInboundMessage(message("/read 1"));
+	const posted = harness.apiCalls.filter((call) => call.method === "POST" && call.path.includes("/messages"));
+	assert.equal(posted.length, 1);
+	assert.match(posted[0].payload.content, /1 message loaded into the chat context/);
+	assert.equal(harness.chatCalls.length, 0);
+	assert.equal(harness.bridge.loadedBatches(AUTHOR_ID).length, 1);
+
+	harness.apiCalls.length = 0;
+	await harness.bridge.onInboundMessage(message("/context"));
+	const shown = harness.apiCalls.find((call) => call.method === "POST" && call.path.includes("/messages"));
+	assert.match(shown.payload.content, /Loaded chat context/);
+	assert.match(shown.payload.content, /#general/);
+
+	harness.apiCalls.length = 0;
+	await harness.bridge.onInboundMessage(message("/context clear"));
+	const cleared = harness.apiCalls.find((call) => call.method === "POST" && call.path.includes("/messages"));
+	assert.match(cleared.payload.content, /Chat context cleared/);
+	assert.equal(harness.bridge.loadedBatches(AUTHOR_ID).length, 0);
+});
+
 test("/read explains that a user-installed app cannot read third-party DM history", async () => {
 	const harness = createHarness();
 	harness.apiCalls.length = 0;
