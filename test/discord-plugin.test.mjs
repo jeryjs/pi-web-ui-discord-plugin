@@ -118,14 +118,27 @@ test("configuration helpers keep the bot token out of plaintext storage", () => 
 test("native command definitions include all required commands and autocomplete options", () => {
 	assert.deepEqual(
 		DISCORD_COMMANDS.map((command) => command.name),
-		["help", "status", "new", "clear", "cwd", "model"],
+		["help", "status", "new", "clear", "cancel", "cwd", "model", "thinking", "system"],
 	);
 	const cwd = DISCORD_COMMANDS.find((command) => command.name === "cwd");
 	const model = DISCORD_COMMANDS.find((command) => command.name === "model");
+	const thinking = DISCORD_COMMANDS.find((command) => command.name === "thinking");
+	const system = DISCORD_COMMANDS.find((command) => command.name === "system");
 	assert.equal(cwd.options[0].autocomplete, true);
 	assert.equal(cwd.options[0].name, "path");
 	assert.equal(model.options[0].autocomplete, true);
 	assert.equal(model.options[0].name, "model");
+	assert.deepEqual(
+		thinking.options[0].choices.map((choice) => choice.value),
+		["off", "low", "medium", "high", "max"],
+	);
+	assert.deepEqual(
+		system.options.map((option) => option.name),
+		["replace", "append"],
+	);
+	for (const option of system.options) {
+		assert.equal(option.required, false);
+	}
 	for (const command of DISCORD_COMMANDS) {
 		assert.match(command.name, /^[a-z0-9_-]{1,32}$/);
 		assert.ok(command.description.length >= 1 && command.description.length <= 100);
@@ -286,8 +299,11 @@ test("native guild commands are registered with Discord's bulk-overwrite route",
 		"status",
 		"new",
 		"clear",
+		"cancel",
 		"cwd",
 		"model",
+		"thinking",
+		"system",
 	]);
 	assert.ok(harness.bridge.registeredGuilds.has("949381557267857469"));
 	await harness.bridge.registerGuildCommands("949381557267857469");

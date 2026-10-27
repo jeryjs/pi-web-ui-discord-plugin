@@ -57,3 +57,26 @@ test("disposing the plugin host bridge rejects pending requests", async () => {
 	bridge.dispose();
 	await assert.rejects(pending, /closed before the request completed/);
 });
+
+test("plugin host requests also match the pi-web-ui __rid correlation token", async () => {
+	let onData = null;
+	const sent = [];
+	const bridge = createHostRequestBridge({
+		send: (message) => sent.push(message),
+		onData: (handler) => {
+			onData = handler;
+			return () => {};
+		},
+	});
+
+	const pending = bridge.send("get_state");
+	assert.ok(sent[0].__rid);
+	assert.equal(sent[0].__rid, sent[0].requestId);
+	onData({ type: "state", __rid: sent[0].__rid, botStatus: { state: "connected" } });
+	assert.deepEqual(await pending, {
+		type: "state",
+		__rid: sent[0].__rid,
+		botStatus: { state: "connected" },
+	});
+	bridge.dispose();
+});
