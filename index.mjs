@@ -1553,7 +1553,18 @@ export class DiscordBotBridge {
 				if (index === 0 && run.replyToMessageId) {
 					payload.message_reference = { message_id: run.replyToMessageId };
 				}
-				await this.api(config.botToken, "POST", `/channels/${run.channelId}/messages`, payload);
+				try {
+					await this.api(config.botToken, "POST", `/channels/${run.channelId}/messages`, payload);
+				} catch (error) {
+					// A stale or malformed reply reference must never swallow the
+					// answer: post the same chunk again without the reference.
+					if (index === 0 && payload.message_reference) {
+						delete payload.message_reference;
+						await this.api(config.botToken, "POST", `/channels/${run.channelId}/messages`, payload);
+					} else {
+						throw error;
+					}
+				}
 				this.status.messagesReplied += 1;
 				this.status.lastReplyAt = Date.now();
 			}

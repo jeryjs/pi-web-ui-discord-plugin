@@ -396,3 +396,28 @@ test("a run without message events recovers the text from the pseudo client tran
 	);
 	assert.equal(reply.at(-1).payload.content, "recovered answer");
 });
+
+test("a reply that fails with a reply reference is posted again without it", async () => {
+	const harness = createHarness();
+	const posts = [];
+	harness.bridge.api = async (token, method, path, payload) => {
+		if (method === "POST" && path === `/channels/${CHANNEL_ID}/messages`) {
+		if (method === "POST" && path === `/channels/${CHANNEL_ID}/messages`) {
+			posts.push({
+				...payload,
+				message_reference: payload.message_reference
+					? { ...payload.message_reference }
+					: undefined,
+			});
+			if (payload.message_reference) throw new Error("Invalid Form Body");
+		}
+			if (payload.message_reference) throw new Error("Invalid Form Body");
+		}
+		return { id: "message-1" };
+	};
+	await harness.bridge.onInboundMessage(message("hello"));
+	assert.equal(posts.length, 2);
+	assert.deepEqual(posts[0].message_reference, { message_id: "user-message-1" });
+	assert.equal(posts[1].message_reference, undefined);
+	assert.equal(posts[1].content, "ok");
+});
