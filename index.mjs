@@ -7,7 +7,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { readdir as fsReaddir, stat as fsStat } from "node:fs/promises";
+import { readdir as fsReaddir, stat as fsStat, mkdir as fsMkdir } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { chunkMarkdownText } from "./markdown-chunks.mjs";
 
@@ -784,7 +784,7 @@ export class DiscordBotBridge {
 		this.persistUserContexts = persistUserContexts || (async () => {});
 		this.log = log || ((level, message) => console.log(`[discord-bot:${level}] ${message}`));
 		this.api = api || discordApi;
-		this.fs = fsImpl || { readdir: fsReaddir, stat: fsStat };
+		this.fs = fsImpl || { readdir: fsReaddir, stat: fsStat, mkdir: fsMkdir };
 		this.webSocketFactory =
 			webSocketFactory || ((url) => new globalThis.WebSocket(url));
 
@@ -904,8 +904,25 @@ export class DiscordBotBridge {
 		return { mode: "none", prompt: "" };
 	}
 
-	resolveWorkspace(authorId, config = this.getConfig()) {
-		return String(this.userWorkspaces.get(authorId) || config?.workspace || this.host?.cwd || "").trim();
+	async resolveWorkspace(authorId, config = this.getConfig()) {
+		const existing = String(this.userWorkspaces.get(authorId) || "").trim();
+		if (existing) return existing;
+		const base = String(config?.workspace || this.host?.cwd || "").trim();
+		if (!base) return "";
+		const workspace = resolve(base, String(authorId));
+		await this.ensureWorkspaceDirectory(workspace);
+		this.userWorkspaces.set(authorId, workspace);
+		await this.persistUserWorkspaces(Object.fromEntries(this.userWorkspaces));
+		return workspace;
+	}
+
+	/** Create the workspace directory for a user if it does not exist yet. */
+	async ensureWorkspaceDirectory(workspace) {
+		try {
+			await this.fs.mkdir(workspace, { recursive: true });
+		} catch (error) {
+			this.log("warn", `Failed to create workspace directory ${workspace}: ${error?.message || error}`);
+		}
 	}
 
 	/** Stable per-user account ID; the generation changes after an explicit reset. */
@@ -1588,7 +1605,7 @@ export class DiscordBotBridge {
 			const focused = interaction?.data?.options?.find((option) => option?.focused);
 			const query = String(focused?.value || "").trim();
 			if (name === "cwd") {
-				const root = this.resolveWorkspace(authorId, config);
+				const root = await this.resolveWorkspace(authorId, config);
 				if (root) choices = await buildDirectoryChoices(root, query, { fsImpl: this.fs });
 			} else if (name === "model") {
 				const catalog = await this.getModelCatalog();
@@ -1659,6 +1676,7 @@ export class DiscordBotBridge {
 
 		if (command === "status") {
 			const status = this.getStatus();
+			const workspace = await this.resolveWorkspace(authorId, config) || "(host default)";
 			const guilds = status.registeredGuilds.length
 				? status.registeredGuilds.join(", ")
 				: "none yet";
@@ -1673,7 +1691,7 @@ export class DiscordBotBridge {
 				`- User install: https://discord.com/oauth2/authorize?client_id=${this.applicationId || "CLIENT_ID"}&integration_type=1&scope=applications.commands`,
 				`- Messages received: ${status.messagesReceived}`,
 				`- Replies sent: ${status.messagesReplied}`,
-				`- Workspace: ${this.resolveWorkspace(authorId, config) || "(host default)"}`,
+				`- Workspace: ${workspace || "(host default)"}`
 				`- Model: ${config.model || "(host default)"}`,
 				`- Thinking level: ${config.thinkingLevel || "(host default)"}`,
 				`- Automatic reply channels: ${autoReplyChannels(config).join(", ") || "none"}`,
@@ -1699,10 +1717,10 @@ export class DiscordBotBridge {
 
 		if (command === "cwd") {
 			if (!argument) {
-				const workspace = this.resolveWorkspace(authorId, config) || "(host default)";
+				const workspace = (await this.resolveWorkspace(authorId, config)) || "(host default)";
 				return `📂 Current workspace: ${workspace}\nUse \`/cwd <path>\` to switch directories.`;
 			}
-			const currentRoot = this.resolveWorkspace(authorId, config) || this.host?.cwd || process.cwd();
+			const currentRoot = (await this.resolveWorkspace(authorId, config)) || this.host?.cwd || process.cwd();
 			const targetPath = isAbsolute(argument) ? resolve(argument) : resolve(currentRoot, argument);
 			let stat;
 			try {
@@ -1812,7 +1830,7 @@ export class DiscordBotBridge {
 	 */
 	async resolveWorkspaceConversation(authorId, config = this.getConfig()) {
 		if (config?.useWorkspaceSession === false) return "";
-		const workspace = this.resolveWorkspace(authorId, config);
+		const workspace = await this.resolveWorkspace(authorId, config);
 		if (!workspace) return "";
 		const target = resolve(workspace);
 
@@ -1973,7 +1991,7 @@ export class DiscordBotBridge {
 			}),
 			accountId,
 		};
-		const workspace = this.resolveWorkspace(authorId, config);
+		const workspace = await this.resolveWorkspace(authorId, config);
 		if (workspace) request.cwd = workspace;
 		if (config.model) request.model = config.model;
 		if (config.thinkingLevel) request.thinkingLevel = config.thinkingLevel;
