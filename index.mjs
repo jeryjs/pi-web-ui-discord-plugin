@@ -14,7 +14,7 @@ import { chunkMarkdownText } from "./markdown-chunks.mjs";
 export const SECRET_BOT_TOKEN = "discord.botToken";
 
 export const DISCORD_API_BASE = "https://discord.com/api/v10";
-export const PLUGIN_VERSION = "1.3.1";
+export const PLUGIN_VERSION = "1.5.0";
 
 export const DISCORD_INTENTS = Object.freeze({
 	GUILDS: 1 << 0,
