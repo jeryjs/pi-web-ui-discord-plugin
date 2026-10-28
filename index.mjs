@@ -1691,7 +1691,7 @@ export class DiscordBotBridge {
 				`- User install: https://discord.com/oauth2/authorize?client_id=${this.applicationId || "CLIENT_ID"}&integration_type=1&scope=applications.commands`,
 				`- Messages received: ${status.messagesReceived}`,
 				`- Replies sent: ${status.messagesReplied}`,
-				`- Workspace: ${workspace || "(host default)"}`
+				`- Workspace: ${workspace || "(host default)"}`,
 				`- Model: ${config.model || "(host default)"}`,
 				`- Thinking level: ${config.thinkingLevel || "(host default)"}`,
 				`- Automatic reply channels: ${autoReplyChannels(config).join(", ") || "none"}`,
@@ -1832,13 +1832,18 @@ export class DiscordBotBridge {
 		if (config?.useWorkspaceSession === false) return "";
 		const workspace = await this.resolveWorkspace(authorId, config);
 		if (!workspace) return "";
-		const target = resolve(workspace);
+		// Every Discord user works in a subfolder of the configured workspace,
+		// but the session to reuse is the one pi-web-ui runs in the workspace
+		// itself: both paths are accepted.
+		const base = String(config?.workspace || this.host?.cwd || "").trim();
+		const targets = new Set([resolve(workspace)]);
+		if (base) targets.add(resolve(base));
 
 		try {
 			const active = await this.host?.getActiveConversation?.({ fallback: "latest-non-subagent" });
 			const activeId = String(active?.conversationId || active?.id || "").trim();
 			const activeCwd = String(active?.cwd || "").trim();
-			if (activeId && activeCwd && resolve(activeCwd) === target) return activeId;
+			if (activeId && activeCwd && targets.has(resolve(activeCwd))) return activeId;
 		} catch {}
 
 		try {
@@ -1849,7 +1854,7 @@ export class DiscordBotBridge {
 				const kind = String(conversation?.kind || "").trim();
 				if (kind && kind !== "running") continue;
 				const cwd = String(conversation?.cwd || "").trim();
-				if (!cwd || resolve(cwd) !== target) continue;
+				if (!cwd || !targets.has(resolve(cwd))) continue;
 				return id;
 			}
 		} catch {}
