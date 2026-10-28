@@ -157,6 +157,23 @@ export default {
 										<label for="discord-cfg-workspace-session" style="font-size: 12px; cursor: pointer; user-select: none;">Reuse the pi session open in pi-web-ui for this workspace</label>
 									</div>
 								</div>
+								<div style="margin-top: 10px;">
+									<div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
+										<input type="checkbox" id="discord-cfg-show-tool-calls" class="discord-cfg-show-tool-calls" style="cursor: pointer;" />
+										<label for="discord-cfg-show-tool-calls" style="font-size: 12px; cursor: pointer; user-select: none;">Show tool calls and thinking steps while the agent works</label>
+									</div>
+									<div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
+										<input type="checkbox" id="discord-cfg-live-reply" class="discord-cfg-live-reply" style="cursor: pointer;" />
+										<label for="discord-cfg-live-reply" style="font-size: 12px; cursor: pointer; user-select: none;">Stream the answer into one live message (edited in place)</label>
+									</div>
+									<div style="display: flex; align-items: center; gap: 8px;">
+										<input type="checkbox" id="discord-cfg-allow-attachments" class="discord-cfg-allow-attachments" style="cursor: pointer;" />
+										<label for="discord-cfg-allow-attachments" style="font-size: 12px; cursor: pointer; user-select: none;">Let the model see files, images and custom emoji sent in Discord</label>
+									</div>
+									<div style="margin-top: 6px; font-size: 11px; color: var(--text-dim);">
+										Attachments are downloaded into <code>.pi-web-discord/attachments</code> inside the workspace and deleted after 7 days. Images are handed to the model natively.
+									</div>
+								</div>
 							</div>
 						</div>
 						<div style="padding: 12px 16px; border-top: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; background: var(--bg-elev);">
@@ -195,6 +212,9 @@ export default {
 		const configAutoReplyChannels = query(".discord-cfg-auto-reply-channels");
 		const configSystemPrompt = query(".discord-cfg-system-prompt");
 		const configWorkspaceSession = query(".discord-cfg-workspace-session");
+		const configShowToolCalls = query(".discord-cfg-show-tool-calls");
+		const configLiveReply = query(".discord-cfg-live-reply");
+		const configAllowAttachments = query(".discord-cfg-allow-attachments");
 
 
 		let currentState = {};
@@ -262,6 +282,9 @@ export default {
 						`Core prompt: ${config.systemPrompt ? config.systemPromptMode || "replace" : "built-in"}`,
 						`Automatic reply channels: ${automatic}`,
 						`Workspace session reuse: ${config.useWorkspaceSession === false ? "off" : "on"}`,
+						`Tool trace: ${config.showToolCalls ? "on" : "off"}`,
+						`Live streaming: ${config.liveReplyEnabled ? "on" : "off"}`,
+						`Attachments: ${config.allowAttachments ? "on" : "off"}`,
 					].join(" · ");
 				}
 			} catch (error) {
@@ -296,6 +319,9 @@ export default {
 				: "";
 			configSystemPrompt.value = config.systemPrompt || "";
 			configWorkspaceSession.checked = config.useWorkspaceSession !== false;
+			configShowToolCalls.checked = Boolean(config.showToolCalls);
+			configLiveReply.checked = Boolean(config.liveReplyEnabled);
+			configAllowAttachments.checked = Boolean(config.allowAttachments);
 
 
 			try {
@@ -374,6 +400,9 @@ export default {
 				systemPrompt: configSystemPrompt.value.trim(),
 				systemPromptMode: configSystemPrompt.value.trim() ? "replace" : "",
 				useWorkspaceSession: Boolean(configWorkspaceSession.checked),
+				showToolCalls: Boolean(configShowToolCalls.checked),
+				liveReplyEnabled: Boolean(configLiveReply.checked),
+				allowAttachments: Boolean(configAllowAttachments.checked),
 			};
 			const result = await sendHost("save_config", { config });
 			button.disabled = false;

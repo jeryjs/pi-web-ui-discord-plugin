@@ -23,6 +23,9 @@ The plugin has **no runtime npm dependencies** and uses Node's built-in `fetch`,
 - Encrypted bot-token storage through the pi-web-ui secrets API
 - Structure-aware Markdown reply chunking
 - Optional Discord message-sending AI tool
+- Optional live tool trace (`think -> bash -> read`) while the agent works
+- Optional live-streamed answers that are edited in place instead of posted twice
+- Optional attachment support: files, images, and custom emoji are handed to the model
 - English dashboard, status messages, and documentation
 
 ## Requirements
@@ -113,6 +116,9 @@ The dashboard stores these values:
 | `autoReplyEnabled` | Answers every message in `defaultChannelId` without an @mention. |
 | `autoReplyChannels` | Extra channel IDs that answer every message without an @mention. |
 | `useWorkspaceSession` | Reuses the pi session open in pi-web-ui for the same workspace (default on). |
+| `showToolCalls` | Adds the agent's thinking steps and tool names to the Discord answer. |
+| `liveReplyEnabled` | Streams the answer into one Discord message that is edited in place. |
+| `allowAttachments` | Downloads files, images, and custom emoji and shows them to the model. |
 
 Per-user `/cwd` overrides are stored under the plugin's `userWorkspaces` storage key. The bot token is never written to plaintext `storage.json`.
 
@@ -163,6 +169,29 @@ file.
 collects output that belongs to the turn it dispatched: events older than the dispatch are ignored and
 the text collected before the Discord turn began is dropped when that turn starts. A `run_end` that
 belongs to the browser tab therefore does not end the Discord reply.
+
+
+## Live tool traces, streamed replies, and attachments
+
+**Tool trace.** With `showToolCalls` enabled the Discord answer shows what the agent did while it
+worked: a `think -> bash -> read` line for every step, followed by the text that was written in that
+step. The tool arguments are never sent to Discord - only the tool names are. The option also works
+without streaming, so the trace is part of the final answer.
+
+**Live streaming.** With `liveReplyEnabled` enabled the bot posts one message as soon as the agent
+starts working and edits that message in place while the answer grows, so the channel shows the
+progress instead of waiting for the final text. Edits are throttled to one every 1.2 seconds to stay
+inside Discord's edit rate limit, and an answer longer than 2,000 characters continues in the next
+message.
+
+**Attachments.** With `allowAttachments` enabled the bot downloads the files of an inbound message
+and the custom emoji it contains into `.pi-web-discord/attachments/<message-id>/` inside the
+user's workspace folder, and passes their paths to the agent in a `<discord_attachments>` block. The
+agent reads the files with its usual `read` tool, so images are delivered to the model natively and
+text files are read as text. Downloads are limited to 10 files of 25 MB each, and folders that are
+older than seven days are removed on the next download. Without the option nothing is ever fetched.
+
+All three options are off by default and are toggled in **Settings -> Discord -> Configure**.
 
 ## Session isolation and reset behavior
 

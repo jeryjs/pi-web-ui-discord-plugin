@@ -7,8 +7,8 @@
  */
 
 import { createHash } from "node:crypto";
-import { readdir as fsReaddir, stat as fsStat, mkdir as fsMkdir } from "node:fs/promises";
-import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { mkdir as fsMkdir, readdir as fsReaddir, rm as fsRm, stat as fsStat, writeFile as fsWriteFile } from "node:fs/promises";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { chunkMarkdownText } from "./markdown-chunks.mjs";
 
 export const SECRET_BOT_TOKEN = "discord.botToken";
@@ -249,6 +249,16 @@ const LATE_TEXT_GRACE_MS = 1_500;
 const EVENT_CLOCK_SKEW_MS = 2_000;
 /** Quiet period before a shared conversation is treated as "our turn is over". */
 const SHARED_RUN_SETTLE_MS = 2_500;
+/** Minimum delay between Discord message edits (Discord allows ~5 edits / 5s). */
+const LIVE_EDIT_MIN_INTERVAL_MS = 1_200;
+/** Maximum number of attachments downloaded for a single Discord message. */
+const MAX_ATTACHMENTS = 10;
+/** Maximum size of a single downloaded attachment. */
+const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+/** Downloaded attachments older than this are pruned. */
+const ATTACHMENT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+/** Folder (inside the workspace) that holds the downloaded Discord attachments. */
+const ATTACHMENT_DIR = ".pi-web-discord/attachments";
 const MODEL_CACHE_MS = 30_000;
 const AUTOCOMPLETE_TIMEOUT_MS = 2_000;
 
@@ -366,6 +376,7 @@ export function buildRequestText({
 	config = {},
 	replyContext = "",
 	loadedContext = "",
+	attachments = "",
 	includeCorePrompt = true,
 	corePrompt = null,
 } = {}) {
@@ -392,6 +403,10 @@ export function buildRequestText({
 	const loaded = String(loadedContext || "").trim();
 	if (loaded) {
 		parts.push("<discord_context>", loaded, "</discord_context>");
+	}
+	const files = String(attachments || "").trim();
+	if (files) {
+		parts.push(files);
 	}
 	parts.push("<discord_user_message>", body, "</discord_user_message>");
 	return parts.join("\n");
@@ -584,6 +599,155 @@ export function extractLastAssistantText(conversation, { since = 0 } = {}) {
 		if (text) return text;
 	}
 	return "";
+}
+
+/**
+ * Extract the activity of one assistant message.
+ *
+ * Only the kind of activity matters for the Discord trace: thinking blocks,
+ * tool calls (by name) and the text the model produced.
+ */
+export function extractAssistantActivity(message) {
+	const content = Array.isArray(message?.content) ? message.content : [];
+	const activity = [];
+	for (const part of content) {
+		if (!part || typeof part !== "object") continue;
+		if (part.type === "thinking") {
+			activity.push({ think: true });
+		} else if (part.type === "toolCall") {
+			activity.push({ tool: String(part.name || "tool") });
+		} else if (part.type === "text") {
+			const text = String(part.text || "");
+			if (text) activity.push({ text });
+		}
+	}
+	return activity;
+}
+
+/**
+ * Append one assistant activity to the trace of a run.
+ *
+ * The trace mirrors what the user watches while the agent works: a line of
+ * `think -> tool -> tool` steps, followed by the text produced in that step.
+ * A step that starts after text was written opens a new segment.
+ */
+export function appendRunActivity(run, activity) {
+	if (!run) return null;
+	if (!Array.isArray(run.segments)) run.segments = [];
+	if (!run.segments.length) run.segments.push({ trace: [], text: "" });
+	let segment = run.segments[run.segments.length - 1];
+	const think = Boolean(activity?.think);
+	const tool = String(activity?.tool || "").trim();
+	const text = typeof activity?.text === "string" ? activity.text : "";
+	if ((think || tool) && String(segment.text || "").trim()) {
+		segment = { trace: [], text: "" };
+		run.segments.push(segment);
+	}
+	if (think && segment.trace[segment.trace.length - 1] !== "think") segment.trace.push("think");
+	if (tool) segment.trace.push(tool);
+	if (text) segment.text += text;
+	return segment;
+}
+
+/** Render the live view of a run: one trace line plus its text per segment. */
+export function renderRunContent(run, { showTrace = true } = {}) {
+	const segments = Array.isArray(run?.segments) ? run.segments : [];
+	if (!showTrace) {
+		return segments
+			.map((segment) => String(segment?.text || "").trim())
+			.filter(Boolean)
+			.join("\n");
+	}
+	const blocks = [];
+	for (const segment of segments) {
+		const trace = (Array.isArray(segment?.trace) ? segment.trace : []).join(" -> ");
+		const text = String(segment?.text || "").trim();
+		if (!trace && !text) continue;
+		blocks.push(trace ? (text ? `${trace}\n${text}` : trace) : text);
+	}
+	return blocks.join("\n");
+}
+
+/** Pick the split point that keeps a live Discord page below the limit. */
+export function findLiveCut(text, limit = DISCORD_MESSAGE_LIMIT) {
+	const body = String(text || "");
+	if (body.length <= limit) return body.length;
+	const newline = body.lastIndexOf("\n", limit);
+	return newline > limit * 0.5 ? newline : limit;
+}
+
+/** Whether an attachment type is safe to download and hand to the agent. */
+export function isSupportedAttachmentType(contentType, filename = "") {
+	const type = String(contentType || "").toLowerCase().split(";")[0].trim();
+	if (type.startsWith("image/")) return type !== "image/svg+xml";
+	if (type.startsWith("text/")) return true;
+	if (["application/json", "application/xml", "application/javascript", "application/x-yaml", "application/yaml", "application/toml", "application/sql"].includes(type)) return true;
+	const extension = String(filename || "").toLowerCase().split(".").pop() || "";
+	return ["txt", "md", "markdown", "json", "jsonl", "yaml", "yml", "toml", "ini", "cfg", "csv", "tsv", "log", "js", "jsx", "ts", "tsx", "py", "rb", "go", "rs", "java", "kt", "c", "h", "cpp", "hpp", "sh", "bash", "zsh", "sql", "html", "css", "xml"].includes(extension);
+}
+
+/** Build a safe file name for a downloaded attachment. */
+export function safeAttachmentName(filename, fallback = "attachment") {
+	const base = String(filename || "")
+		.split(/[\\/]/)
+		.pop()
+		.replace(/[^\w.\- ]+/g, "_")
+		.trim()
+		.slice(0, 80);
+	return base || fallback;
+}
+
+/**
+ * Collect the attachments of an inbound Discord message.
+ *
+ * Files arrive as attachments; custom emoji are fetched from the CDN.
+ */
+export function collectMessageAttachments(message) {
+	const items = [];
+	const attachments = Array.isArray(message?.attachments) ? message.attachments : [];
+	for (const attachment of attachments) {
+		const url = String(attachment?.url || "").trim();
+		if (!url) continue;
+		items.push({
+			url,
+			size: Number(attachment?.size || 0),
+			contentType: String(attachment?.content_type || "").trim(),
+			filename: String(attachment?.filename || "attachment").trim(),
+			kind: "file",
+		});
+	}
+	const content = String(message?.content || "");
+	const emojiPattern = /<a?:([a-zA-Z0-9_]+):(\d{15,})>/g;
+	for (const match of content.matchAll(emojiPattern)) {
+		const [, name, id] = match;
+		const animated = content.includes(`<a:${name}:${id}>`);
+		items.push({
+			url: `https://cdn.discordapp.com/emojis/${id}.${animated ? "gif" : "png"}`,
+			size: 0,
+			contentType: animated ? "image/gif" : "image/png",
+			filename: `emoji-${name}.${animated ? "gif" : "png"}`,
+			kind: "emoji",
+		});
+	}
+	return items.slice(0, MAX_ATTACHMENTS);
+}
+
+/** Describe the downloaded attachments for the agent prompt. */
+export function buildAttachmentContext(downloaded = [], skipped = []) {
+	if (!downloaded.length && !skipped.length) return "";
+	const lines = [];
+	if (downloaded.length) {
+		lines.push("The user sent these files with the message. Read them with the read tool - images are delivered to you natively.");
+		for (const [index, item] of downloaded.entries()) {
+			const type = item.contentType ? ` (${item.contentType})` : "";
+			lines.push(`${index + 1}. ${item.kind === "emoji" ? "emoji" : "file"} "${item.filename}"${type} -> ${item.path}`);
+		}
+	}
+	if (skipped.length) {
+		const names = skipped.map((item) => `"${item.filename}"`).join(", ");
+		lines.push(`Not downloaded (unsupported type or too large): ${names}`);
+	}
+	return ["<discord_attachments>", ...lines, "</discord_attachments>"].join("\n");
 }
 /** Normalize the configured Discord user allowlist. */
 export function normalizeAllowedUsers(value) {
@@ -784,7 +948,7 @@ export class DiscordBotBridge {
 		this.persistUserContexts = persistUserContexts || (async () => {});
 		this.log = log || ((level, message) => console.log(`[discord-bot:${level}] ${message}`));
 		this.api = api || discordApi;
-		this.fs = fsImpl || { readdir: fsReaddir, stat: fsStat, mkdir: fsMkdir };
+		this.fs = fsImpl || { readdir: fsReaddir, stat: fsStat, mkdir: fsMkdir, writeFile: fsWriteFile, rm: fsRm };
 		this.webSocketFactory =
 			webSocketFactory || ((url) => new globalThis.WebSocket(url));
 
@@ -1924,8 +2088,9 @@ export class DiscordBotBridge {
 		void this.api(config.botToken, "POST", `/channels/${channelId}/typing`, null).catch(() => {});
 
 		const replyContext = buildReplyContext(referencedMessage, { botId });
+		const attachments = await this.collectAttachmentContext(message, { config, authorId });
 		const run = this.createRun({ channelId, authorId, replyToMessageId: message.id });
-		const request = await this.buildRequest({ text: cleanText, config, replyContext, authorId });
+		const request = await this.buildRequest({ text: cleanText, config, replyContext, authorId, attachments });
 
 		await this.enqueueDispatch(run, request);
 	}
@@ -1955,6 +2120,13 @@ export class DiscordBotBridge {
 			sawTurnStart: false,
 			turnOpened: false,
 			settleTimer: null,
+			segments: [],
+			liveEnabled: this.getConfig().liveReplyEnabled === true && !interaction,
+			liveMessageId: "",
+			livePageStart: 0,
+			liveRenderedLength: 0,
+			liveUpdatedAt: 0,
+			liveTimer: null,
 			generation,
 			cancelled: false,
 			finished: false,
@@ -1979,6 +2151,7 @@ export class DiscordBotBridge {
 		replyContext = "",
 		authorId = "",
 		excludeContextChannelId = "",
+		attachments = "",
 	} = {}) {
 		const accountId = this.userAccountId(authorId);
 		const botId = String(this.botUser?.id || "");
@@ -1992,6 +2165,7 @@ export class DiscordBotBridge {
 				config,
 				replyContext,
 				loadedContext,
+				attachments,
 				corePrompt: this.corePromptInjection(authorId, config),
 			}),
 			accountId,
@@ -2204,16 +2378,19 @@ export class DiscordBotBridge {
 
 			const errorMessage = String(event.message.errorMessage || "").trim();
 			if (errorMessage) this.noteRunError(conversationId, errorMessage);
+			const activity = extractAssistantActivity(event.message);
 			const content = extractAssistantContent(event.message);
-			if (!content) return;
 
 			if (run) {
-				run.accumulatedText += `${run.accumulatedText ? "\n" : ""}${content}`;
+				if (content) run.accumulatedText += `${run.accumulatedText ? "\n" : ""}${content}`;
+				// The trace records what the agent did: thinking and tool names.
+				for (const item of activity) appendRunActivity(run, item);
 				this.clearRunSettle(run);
+				if (activity.length) this.scheduleLiveUpdate(run, this.getConfig());
 			} else {
 				const early = this.earlyRuns.get(conversationId) || { accumulatedText: "", firstAt: 0 };
 				if (!early.firstAt) early.firstAt = eventAt;
-				early.accumulatedText += `${early.accumulatedText ? "\n" : ""}${content}`;
+				if (content) early.accumulatedText += `${early.accumulatedText ? "\n" : ""}${content}`;
 				this.earlyRuns.set(conversationId, early);
 			}
 			return;
@@ -2307,9 +2484,16 @@ export class DiscordBotBridge {
 		if (run.delivered) return;
 		run.delivered = true;
 		const config = this.getConfig();
-		let rawText = timedOut ? "⏱️ Task timed out after 10 minutes." : run.accumulatedText;
+		const showTrace = config.showToolCalls === true;
+		let rawText = timedOut
+			? "⏱️ Task timed out after 10 minutes."
+			: showTrace
+				? renderRunContent(run, { showTrace: true })
+				: run.accumulatedText;
 		if (!timedOut && !stripInternalMarkers(rawText)) {
-			rawText = await this.recoverRunText(run);
+			const recovered = await this.recoverRunText(run);
+			const trace = showTrace ? renderRunContent(run, { showTrace: true }) : "";
+			rawText = trace ? `${trace}\n${recovered}`.trim() : recovered;
 		}
 		const finalText = stripInternalMarkers(rawText) || this.describeEmptyRun(run);
 		const chunks = chunkMarkdownText(finalText, DISCORD_MESSAGE_LIMIT);
@@ -2329,6 +2513,17 @@ export class DiscordBotBridge {
 				this.log("warn", `Discord interaction reply delivery failed: ${this.status.lastError}`);
 			}
 			return;
+		}
+
+		// Streamed reply: the message already lives in the channel, so the
+		// answer only has to be written into it.
+		if (run.liveEnabled) {
+			this.stopLiveUpdate(run);
+			if (run.livePromise) await run.livePromise.catch(() => {});
+			if (run.liveMessageId) {
+				await this.finishLiveReply(run, config, finalText);
+				return;
+			}
 		}
 
 		try {
@@ -2355,6 +2550,209 @@ export class DiscordBotBridge {
 		} catch (error) {
 			this.status.lastError = error?.message || String(error);
 			this.log("warn", `Discord reply delivery failed: ${this.status.lastError}`);
+		}
+	}
+
+	/** Post the live reply message (the first page of a streamed answer). */
+	async postLiveMessage(run, config, content) {
+		const payload = { content: String(content || "") };
+		if (!run.liveMessageId && run.replyToMessageId) {
+			payload.message_reference = { message_id: run.replyToMessageId };
+		}
+		try {
+			const message = await this.api(config.botToken, "POST", `/channels/${run.channelId}/messages`, payload);
+			this.status.messagesReplied += 1;
+			this.status.lastReplyAt = Date.now();
+			return message;
+		} catch (error) {
+			// A stale or malformed reply reference must never swallow the answer.
+			if (payload.message_reference) {
+				delete payload.message_reference;
+				const message = await this.api(config.botToken, "POST", `/channels/${run.channelId}/messages`, payload);
+				this.status.messagesReplied += 1;
+				this.status.lastReplyAt = Date.now();
+				return message;
+			}
+			throw error;
+		}
+	}
+
+	/** Post or edit the live Discord message with the current run view. */
+	async flushLiveUpdate(run, config) {
+		if (!run?.liveEnabled) return;
+		const promise = this.updateLiveMessage(run, config);
+		run.livePromise = promise;
+		try {
+			await promise;
+		} finally {
+			if (run.livePromise === promise) run.livePromise = null;
+		}
+	}
+
+	/** Write the current run view into the live Discord message. */
+	async updateLiveMessage(run, config) {
+		if (!run?.liveEnabled) return;
+		const showTrace = config.showToolCalls === true;
+		const rendered = renderRunContent(run, { showTrace });
+		const content = rendered || "⏳ Working…";
+		try {
+			if (!run.liveMessageId) {
+				const message = await this.postLiveMessage(run, config, content);
+				run.liveMessageId = String(message?.id || "");
+				run.livePageStart = 0;
+				run.liveRenderedLength = rendered.length;
+				return;
+			}
+			const page = content.slice(Number(run.livePageStart || 0));
+			if (page.length <= DISCORD_MESSAGE_LIMIT) {
+				await this.api(config.botToken, "PATCH", `/channels/${run.channelId}/messages/${run.liveMessageId}`, {
+					content: page || "⏳ Working…",
+				});
+				run.liveRenderedLength = rendered.length;
+				return;
+			}
+			// The page is full: keep what fits and continue in the next message.
+			const cut = findLiveCut(page, DISCORD_MESSAGE_LIMIT);
+			await this.api(config.botToken, "PATCH", `/channels/${run.channelId}/messages/${run.liveMessageId}`, {
+				content: page.slice(0, cut),
+			});
+			const next = await this.postLiveMessage(run, config, page.slice(cut));
+			run.liveMessageId = String(next?.id || "");
+			run.livePageStart = Number(run.livePageStart || 0) + cut;
+			run.liveRenderedLength = rendered.length;
+		} catch (error) {
+			this.status.lastError = error?.message || String(error);
+			this.log("warn", `Discord live update failed: ${this.status.lastError}`);
+		}
+	}
+
+	/** Update the live reply, throttled to the Discord edit rate limit. */
+	scheduleLiveUpdate(run, config) {
+		if (!run?.liveEnabled) return;
+		if (run.liveTimer) return;
+		const elapsed = Date.now() - Number(run.liveUpdatedAt || 0);
+		const wait = Math.max(0, LIVE_EDIT_MIN_INTERVAL_MS - elapsed);
+		if (wait === 0) {
+			run.liveUpdatedAt = Date.now();
+			void this.flushLiveUpdate(run, config);
+			return;
+		}
+		run.liveTimer = setTimeout(() => {
+			run.liveTimer = null;
+			run.liveUpdatedAt = Date.now();
+			void this.flushLiveUpdate(run, config);
+		}, wait);
+		run.liveTimer.unref?.();
+	}
+
+	/** Finish a streamed reply: the message already exists, so only edit it. */
+	async finishLiveReply(run, config, finalText) {
+		const content = String(finalText || "").trim() || "✅ Task completed.";
+		const rendered = renderRunContent(run, { showTrace: config.showToolCalls === true });
+		const aligned = content.startsWith(rendered) && rendered.length >= Number(run.liveRenderedLength || 0);
+		if (!aligned) run.livePageStart = 0;
+		const page = content.slice(Number(run.livePageStart || 0));
+		try {
+			if (page.length <= DISCORD_MESSAGE_LIMIT) {
+				await this.api(config.botToken, "PATCH", `/channels/${run.channelId}/messages/${run.liveMessageId}`, {
+					content: page,
+				});
+				return;
+			}
+			const cut = findLiveCut(page, DISCORD_MESSAGE_LIMIT);
+			await this.api(config.botToken, "PATCH", `/channels/${run.channelId}/messages/${run.liveMessageId}`, {
+				content: page.slice(0, cut),
+			});
+			const next = await this.postLiveMessage(run, config, page.slice(cut));
+			run.liveMessageId = String(next?.id || "");
+			run.livePageStart = Number(run.livePageStart || 0) + cut;
+		} catch (error) {
+			this.status.lastError = error?.message || String(error);
+			this.log("warn", `Discord live reply delivery failed: ${this.status.lastError}`);
+		}
+	}
+
+	/** Stop a pending live edit so it cannot overwrite the final answer. */
+	stopLiveUpdate(run) {
+		if (run?.liveTimer) {
+			clearTimeout(run.liveTimer);
+			run.liveTimer = null;
+		}
+	}
+
+	/**
+	 * Download the attachments of a Discord message and describe them.
+	 *
+	 * Opt-in: without `allowAttachments` the files are never fetched.
+	 */
+	async collectAttachmentContext(message, { config = this.getConfig(), authorId = "" } = {}) {
+		if (config?.allowAttachments !== true) return "";
+		const items = collectMessageAttachments(message);
+		if (!items.length) return "";
+		const workspace = await this.resolveWorkspace(authorId, config);
+		const { downloaded, skipped } = await this.downloadAttachments(items, {
+			workspace,
+			messageId: String(message?.id || ""),
+		});
+		return buildAttachmentContext(downloaded, skipped);
+	}
+
+	/** Download the attachments of a Discord message into the workspace. */
+	async downloadAttachments(items, { workspace, messageId } = {}) {
+		const downloaded = [];
+		const skipped = [];
+		const root = workspace ? resolve(workspace) : "";
+		if (!root) return { downloaded, skipped: items };
+		for (const item of items) {
+			if (!isSupportedAttachmentType(item.contentType, item.filename)) {
+				skipped.push(item);
+				continue;
+			}
+			if (Number(item.size || 0) > MAX_ATTACHMENT_BYTES) {
+				skipped.push(item);
+				continue;
+			}
+			try {
+				const path = await this.fetchAttachment(item, { root, messageId });
+				downloaded.push({ ...item, path });
+			} catch (error) {
+				this.log("warn", `Discord attachment download failed: ${error?.message || error}`);
+				skipped.push(item);
+			}
+		}
+		return { downloaded, skipped };
+	}
+
+	/** Fetch one attachment and store it inside the workspace. */
+	async fetchAttachment(item, { root, messageId }) {
+		const response = await fetch(item.url, { signal: AbortSignal.timeout(30_000) });
+		if (!response.ok) throw new Error(`HTTP ${response.status}`);
+		const buffer = Buffer.from(await response.arrayBuffer());
+		if (buffer.byteLength > MAX_ATTACHMENT_BYTES) throw new Error("attachment exceeds the size limit");
+		const dir = join(root, ATTACHMENT_DIR, String(messageId || "unknown"));
+		await this.fs.mkdir(dir, { recursive: true });
+		const path = join(dir, safeAttachmentName(item.filename));
+		await this.fs.writeFile(path, buffer);
+		await this.pruneAttachments(root);
+		return path;
+	}
+
+	/** Remove attachment folders that are older than the retention window. */
+	async pruneAttachments(root) {
+		try {
+			const base = join(root, ATTACHMENT_DIR);
+			const entries = await this.fs.readdir(base, { withFileTypes: true });
+			const now = Date.now();
+			for (const entry of entries) {
+				if (!entry.isDirectory()) continue;
+				const dir = join(base, entry.name);
+				const stat = await this.fs.stat(dir);
+				if (now - Number(stat.mtimeMs || 0) > ATTACHMENT_TTL_MS) {
+					await this.fs.rm(dir, { recursive: true, force: true });
+				}
+			}
+		} catch {
+			/* pruning is best effort */
 		}
 	}
 
@@ -2535,6 +2933,9 @@ export default async function activate(host) {
 							systemPromptMode: localConfig.systemPromptMode || "",
 							autoReplyEnabled: Boolean(localConfig.autoReplyEnabled),
 							autoReplyChannels: normalizeAutoReplyChannels(localConfig.autoReplyChannels),
+							showToolCalls: Boolean(localConfig.showToolCalls),
+							liveReplyEnabled: Boolean(localConfig.liveReplyEnabled),
+							allowAttachments: Boolean(localConfig.allowAttachments),
 							useWorkspaceSession: localConfig.useWorkspaceSession !== false,
 							botEnabled: Boolean(localConfig.botEnabled),
 							allowedUsers: normalizeAllowedUsers(localConfig.allowedUsers),
