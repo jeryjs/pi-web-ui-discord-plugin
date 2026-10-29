@@ -126,7 +126,7 @@ test("the run trace renders the steps the agent took", () => {
 	})) {
 		appendRunActivity(run, item);
 	}
-	assert.equal(renderRunContent(run, { showTrace: true }), "think -> bash\nfirst answer");
+	assert.equal(renderRunContent(run, { showTrace: true }), "`think → bash`\nfirst answer");
 
 	// A step that starts after text was written opens a new segment.
 	for (const item of extractAssistantActivity({
@@ -139,7 +139,7 @@ test("the run trace renders the steps the agent took", () => {
 	}
 	assert.equal(
 		renderRunContent(run, { showTrace: true }),
-		"think -> bash\nfirst answer\nread\nsecond answer",
+		"`think → bash`\nfirst answer\n`read`\nsecond answer",
 	);
 	assert.equal(renderRunContent(run, { showTrace: false }), "first answer\nsecond answer");
 });

@@ -123,18 +123,21 @@ test("configuration helpers keep the bot token out of plaintext storage", () => 
 test("native command definitions include all required commands and autocomplete options", () => {
 	assert.deepEqual(
 		DISCORD_COMMANDS.map((command) => command.name),
-		["help", "status", "new", "clear", "cancel", "cwd", "model", "thinking", "system", "context", "read", "pi", "pi-message"],
+		["help", "status", "new", "cancel", "cwd", "model", "system", "context", "read", "pi", "pi-message"],
 	);
 	const cwd = DISCORD_COMMANDS.find((command) => command.name === "cwd");
 	const model = DISCORD_COMMANDS.find((command) => command.name === "model");
 	const thinking = DISCORD_COMMANDS.find((command) => command.name === "thinking");
+	assert.equal(thinking, undefined);
 	const system = DISCORD_COMMANDS.find((command) => command.name === "system");
 	assert.equal(cwd.options[0].autocomplete, true);
 	assert.equal(cwd.options[0].name, "path");
 	assert.equal(model.options[0].autocomplete, true);
 	assert.equal(model.options[0].name, "model");
+	assert.equal(model.options[1].name, "thinking");
+	assert.equal(model.options[1].required, false);
 	assert.deepEqual(
-		thinking.options[0].choices.map((choice) => choice.value),
+		model.options[1].choices.map((choice) => choice.value),
 		["off", "low", "medium", "high", "max"],
 	);
 	assert.deepEqual(
@@ -225,9 +228,11 @@ test("replies are re-keyed to the host conversation and posted to the originatin
 	);
 	assert.ok(reply);
 	assert.equal(reply.payload.content, "Hello from pi");
-	assert.deepEqual(reply.payload.message_reference, { message_id: "user-message-1" });
+	// A DM answers with a plain message: no reply reference.
+	assert.equal(reply.payload.message_reference, undefined);
 	assert.equal(harness.bridge.getStatus().messagesReplied, 1);
-	assert.equal(harness.bridge.userConversations.get(AUTHOR_ID), "c1");
+	assert.equal(harness.bridge.userConversations.get(`dm|${AUTHOR_ID}`), "c1");
+	assert.equal(harness.bridge.userSessions.get(`dm|${AUTHOR_ID}`).conversationId, "c1");
 });
 
 test("early assistant events are merged instead of posting to an undefined channel", async () => {
@@ -271,10 +276,10 @@ test("the same user keeps the same pseudo-client account across turns", async ()
 	await harness.bridge.onInboundMessage(message("second"));
 	assert.equal(harness.chatCalls.length, 2);
 	assert.equal(harness.chatCalls[0].accountId, harness.chatCalls[1].accountId);
-	assert.equal(harness.bridge.userConversations.get(AUTHOR_ID), "c1");
+	assert.equal(harness.bridge.userConversations.get(`dm|${AUTHOR_ID}`), "c1");
 });
 
-test("/new and /clear drop the binding and create a new generation", async () => {
+test("/new drops the stored session id and creates a new generation", async () => {
 	const harness = createHarness({
 		hostChat: async (request, bridge) => {
 			setImmediate(async () => {
@@ -291,8 +296,10 @@ test("/new and /clear drop the binding and create a new generation", async () =>
 	await harness.bridge.onInboundMessage(message("first"));
 	const originalAccount = harness.chatCalls[0].accountId;
 	await harness.bridge.onInboundMessage(message("/new"));
-	assert.equal(harness.bridge.userConversations.has(AUTHOR_ID), false);
-	assert.match(harness.bridge.userAccountId(AUTHOR_ID), /_g1$/);
+	assert.equal(harness.bridge.userConversations.has(`dm|${AUTHOR_ID}`), false);
+	assert.equal(harness.bridge.userSessions.has(`dm|${AUTHOR_ID}`), false);
+	assert.equal(harness.config.userSessions[`dm|${AUTHOR_ID}`], undefined);
+	assert.match(harness.bridge.userAccountId(`dm|${AUTHOR_ID}`), /_g1$/);
 	await harness.bridge.onInboundMessage(message("fresh"));
 	assert.notEqual(harness.chatCalls[1].accountId, originalAccount);
 	assert.match(harness.chatCalls[1].accountId, /_g1$/);
@@ -306,7 +313,7 @@ test("/cwd validates and persists a per-user workspace and starts a fresh genera
 	try {
 		await harness.bridge.onInboundMessage(message(`/cwd ${project}`));
 		assert.equal(harness.bridge.userWorkspaces.get(AUTHOR_ID), project);
-		assert.match(harness.bridge.userAccountId(AUTHOR_ID), /_g1$/);
+		assert.match(harness.bridge.userAccountId(`dm|${AUTHOR_ID}`), /_g1$/);
 		const reply = harness.apiCalls.find(
 			(call) => call.method === "POST" && call.path === `/channels/${CHANNEL_ID}/messages`,
 		);
@@ -343,11 +350,9 @@ test("native guild commands are registered with Discord's bulk-overwrite route",
 		"help",
 		"status",
 		"new",
-		"clear",
 		"cancel",
 		"cwd",
 		"model",
-		"thinking",
 		"system",
 		"context",
 		"read",
@@ -380,11 +385,9 @@ test("global commands are registered so user-installed apps can use them in DMs"
 		"help",
 		"status",
 		"new",
-		"clear",
 		"cancel",
 		"cwd",
 		"model",
-		"thinking",
 		"system",
 		"context",
 		"read",
@@ -406,7 +409,7 @@ test("global commands are registered so user-installed apps can use them in DMs"
 	);
 });
 
-test("command responses stay ephemeral outside the app's own DM", async () => {
+test("every slash command response is ephemeral", async () => {
 	const harness = createHarness({ models: [{ id: "openai/gpt-5" }] });
 
 	await harness.bridge.handleInteraction({
@@ -432,7 +435,7 @@ test("command responses stay ephemeral outside the app's own DM", async () => {
 	});
 	const dmResponse = harness.apiCalls.at(-1);
 	assert.equal(dmResponse.path, "/interactions/dm-interaction/interaction-token/callback");
-	assert.equal(dmResponse.payload.data.flags, undefined);
+	assert.equal(dmResponse.payload.data.flags, 64);
 
 	await harness.bridge.handleInteraction({
 		id: "private-channel-interaction",

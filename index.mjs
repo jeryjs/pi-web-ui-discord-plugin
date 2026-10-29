@@ -80,11 +80,6 @@ export const DISCORD_COMMANDS = Object.freeze([
 		type: 1,
 	}),
 	Object.freeze({
-		name: "clear",
-		description: "Clear the current Discord conversation context",
-		type: 1,
-	}),
-	Object.freeze({
 		name: "cancel",
 		description: "Cancel the running Discord task",
 		type: 1,
@@ -105,7 +100,7 @@ export const DISCORD_COMMANDS = Object.freeze([
 	}),
 	Object.freeze({
 		name: "model",
-		description: "Show or change the AI model used by Discord",
+		description: "Show or change the AI model and thinking level used by Discord",
 		type: 1,
 		options: Object.freeze([
 			Object.freeze({
@@ -115,16 +110,9 @@ export const DISCORD_COMMANDS = Object.freeze([
 				required: false,
 				autocomplete: true,
 			}),
-		]),
-	}),
-	Object.freeze({
-		name: "thinking",
-		description: "Show or change the thinking level used by Discord",
-		type: 1,
-		options: Object.freeze([
 			Object.freeze({
-				name: "level",
-				description: "Thinking level (leave empty to show the current one)",
+				name: "thinking",
+				description: "Thinking level (leave empty to keep the current one)",
 				type: 3,
 				required: false,
 				choices: THINKING_LEVELS.map((level) => Object.freeze({ name: level, value: level })),
@@ -241,6 +229,8 @@ export function buildCommandPayload() {
 
 const LEGACY_COMMAND_ALIASES = Object.freeze({
 	workspace: "cwd",
+	// /clear does the same as /new: it drops the stored session id.
+	clear: "new",
 });
 
 const DEFAULT_RUN_TIMEOUT_MS = 10 * 60 * 1000;
@@ -259,6 +249,12 @@ const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 const ATTACHMENT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 /** Folder (inside the workspace) that holds the downloaded Discord attachments. */
 const ATTACHMENT_DIR = ".pi-web-discord/attachments";
+/** Separator between the steps of a tool trace. */
+const TRACE_SEPARATOR = " → ";
+/** How long the metadata of a Discord channel is cached. */
+const CHANNEL_INFO_CACHE_MS = 60_000;
+/** How many of the bot's own message ids are remembered for thread detection. */
+const BOT_MESSAGE_MEMORY = 200;
 const MODEL_CACHE_MS = 30_000;
 const AUTOCOMPLETE_TIMEOUT_MS = 2_000;
 
@@ -279,6 +275,54 @@ export function peerAccountId(userId, prefix = "dc") {
 	if (!raw) return `${prefix}_default`;
 	const hash = createHash("sha256").update(raw).digest("hex").slice(0, 16);
 	return `${prefix}_${hash}`;
+}
+
+/**
+ * The scope of a Discord conversation.
+ *
+ * A DM and a guild channel are separate scopes: the bot never mixes a
+ * private DM conversation into a channel conversation.
+ */
+export function sessionScope({ guildId = "", channelId = "" } = {}) {
+	const guild = String(guildId || "").trim();
+	if (!guild) return "dm";
+	const channel = String(channelId || "").trim();
+	return channel ? `guild:${guild}:${channel}` : `guild:${guild}`;
+}
+
+/** The key that binds one Discord user to one session scope. */
+export function sessionKey(scope, authorId) {
+	return `${scope || "dm"}|${String(authorId || "").trim()}`;
+}
+
+/**
+ * Split the arguments of `/model` into a model and a thinking level.
+ *
+ * Both parts are optional. A model is written as `provider/model`; a bare
+ * word is treated as the thinking level, so `/model high` works.
+ */
+export function parseModelArguments(input) {
+	const text = String(input ?? "").trim();
+	const result = { model: "", thinking: "", thinkingReset: false, invalid: "" };
+	if (!text) return result;
+	for (const part of text.split(/[\s,]+/).filter(Boolean)) {
+		if (part.includes("/")) {
+			result.model = part;
+			continue;
+		}
+		const lower = part.toLowerCase();
+		if (["default", "host", "none", "reset"].includes(lower)) {
+			result.thinking = "";
+			result.thinkingReset = true;
+			continue;
+		}
+		if (THINKING_LEVELS.includes(lower)) {
+			result.thinking = lower;
+			continue;
+		}
+		result.invalid = part;
+	}
+	return result;
 }
 
 /** Extract message text and remove a direct bot mention from it. */
@@ -457,10 +501,18 @@ export function isReplyToBotMessage(message, botId, referencedMessage = null) {
  * A message qualifies when it mentions the bot, replies to the bot, or is sent
  * in a channel configured for automatic replies.
  */
-export function isMessageAddressedToBot(message, { botId = "", config = {}, referencedMessage = null } = {}) {
+export function isMessageAddressedToBot(
+	message,
+	{ botId = "", config = {}, referencedMessage = null, autoReplyThreadIds = null } = {},
+) {
 	if (isBotMentioned(message, botId)) return true;
 	if (isReplyToBotMessage(message, botId, referencedMessage)) return true;
-	return isAutoReplyChannel(message?.channel_id, config);
+	if (isAutoReplyChannel(message?.channel_id, config)) return true;
+	// A thread that was started from a reply of the bot answers automatically,
+	// but only while the default channel automatic replies are switched on.
+	const channelId = String(message?.channel_id || "");
+	if (config?.autoReplyEnabled && channelId && autoReplyThreadIds?.has?.(channelId)) return true;
+	return false;
 }
 
 /** Build the context block for a replied-to Discord message. */
@@ -660,10 +712,11 @@ export function renderRunContent(run, { showTrace = true } = {}) {
 	}
 	const blocks = [];
 	for (const segment of segments) {
-		const trace = (Array.isArray(segment?.trace) ? segment.trace : []).join(" -> ");
+		const trace = (Array.isArray(segment?.trace) ? segment.trace : []).join(TRACE_SEPARATOR);
 		const text = String(segment?.text || "").trim();
 		if (!trace && !text) continue;
-		blocks.push(trace ? (text ? `${trace}\n${text}` : trace) : text);
+		// The trace is shown as inline code so the steps read as one unit.
+		blocks.push(trace ? (text ? `\`${trace}\`\n${text}` : `\`${trace}\``) : text);
 	}
 	return blocks.join("\n");
 }
@@ -967,8 +1020,12 @@ export class DiscordBotBridge {
 		this.userConversations = new Map();
 		this.userWorkspaces = new Map(Object.entries(initialUserWorkspaces || {}));
 		this.userContexts = new Map(Object.entries(initialUserContexts || {}));
+		this.userSessions = new Map(Object.entries(this.getConfig()?.userSessions || {}));
 		this.corePromptStates = new Map();
 		this.userGenerations = new Map();
+		this.autoReplyThreadIds = new Set();
+		this.botMessageIds = new Set();
+		this.channelInfoCache = new Map();
 		this.knownGuilds = new Set();
 		this.registeredGuilds = new Set();
 		this.registeredGlobally = false;
@@ -1002,6 +1059,7 @@ export class DiscordBotBridge {
 			registeredGuilds: [...this.registeredGuilds].sort(),
 			knownGuilds: [...this.knownGuilds].sort(),
 			activeRuns: this.pendingRuns.size,
+			storedSessions: this.userSessions.size,
 		};
 	}
 
@@ -1089,25 +1147,70 @@ export class DiscordBotBridge {
 		}
 	}
 
-	/** Stable per-user account ID; the generation changes after an explicit reset. */
-	userAccountId(authorId) {
-		const generation = Number(this.userGenerations.get(authorId) || 0);
-		const base = peerAccountId(authorId);
+	/** Stable account ID for one session scope; the generation changes after a reset. */
+	userAccountId(key) {
+		const generation = Number(this.userGenerations.get(key) || 0);
+		const base = peerAccountId(key);
 		return generation > 0 ? `${base}_g${generation}` : base;
 	}
 
-	/** Drop the remembered conversation and force the next prompt onto a blank pseudo client. */
-	resetUserConversation(authorId) {
-		const generation = Number(this.userGenerations.get(authorId) || 0) + 1;
-		this.userGenerations.set(authorId, generation);
-		this.userConversations.delete(authorId);
+	/**
+	 * Drop the remembered conversation of one scope and force the next prompt
+	 * onto a blank pseudo client.
+	 *
+	 * The stored session id is removed as well, so the next turn starts a new
+	 * session and writes the new id back to the configuration.
+	 */
+	async resetUserConversation(key, { authorId = "" } = {}) {
+		const generation = Number(this.userGenerations.get(key) || 0) + 1;
+		this.userGenerations.set(key, generation);
+		this.userConversations.delete(key);
+		this.userSessions.delete(key);
+		await this.persistUserSessions();
 		// A fresh conversation starts without the context loaded with /read.
-		this.userContexts.delete(authorId);
-		void this.persistUserContexts(this.serializedUserContexts());
+		if (authorId) {
+			this.userContexts.delete(authorId);
+			void this.persistUserContexts(this.serializedUserContexts());
+		}
 		for (const run of this.pendingRuns.values()) {
 			if (run.authorId === authorId) run.cancelled = true;
 		}
-		return this.userAccountId(authorId);
+		return this.userAccountId(key);
+	}
+
+	/** Remember the session of a scope so it can be reused after a restart. */
+	async rememberUserSession(key, conversationId) {
+		const id = String(conversationId || "").trim();
+		if (!id) return;
+		this.userConversations.set(key, id);
+		this.userSessions.set(key, { conversationId: id, updatedAt: Date.now() });
+		await this.persistUserSessions();
+	}
+
+	/** Write the remembered sessions into the plugin configuration. */
+	async persistUserSessions() {
+		const sessions = Object.fromEntries(this.userSessions);
+		try {
+			await this.updateConfig({ userSessions: sessions });
+		} catch (error) {
+			this.log("warn", `Failed to persist the Discord session records: ${error?.message || error}`);
+		}
+	}
+
+	/**
+	 * The session a scope should continue.
+	 *
+	 * The session open in pi-web-ui is shared, so it is only used for guild
+	 * channels: a DM never lands in a channel conversation, and a channel
+	 * conversation never continues a DM. Without a shared session the scope
+	 * keeps its own session, which survives restarts through the config.
+	 */
+	async resolveSessionTarget({ key = "", scope = "dm", authorId = "", config = this.getConfig() } = {}) {
+		if (config?.useWorkspaceSession !== false && String(scope || "").startsWith("guild:")) {
+			const shared = await this.resolveWorkspaceConversation(authorId, config);
+			if (shared) return shared;
+		}
+		return String(this.userSessions.get(key)?.conversationId || "").trim();
 	}
 
 	async start() {
@@ -1275,6 +1378,8 @@ export class DiscordBotBridge {
 			}
 		} else if (t === "MESSAGE_CREATE") {
 			void this.onInboundMessage(d);
+		} else if (t === "THREAD_CREATE") {
+			void this.onThreadCreate(d);
 		} else if (t === "INTERACTION_CREATE") {
 			void this.handleInteraction(d);
 		}
@@ -1419,13 +1524,11 @@ export class DiscordBotBridge {
 	/**
 	 * Whether an interaction response should be ephemeral.
 	 *
-	 * Only the app's own DM (BOT_DM) can carry a public reply. A user-installed
-	 * app has no bot presence in a third-party DM or GDM, so PRIVATE_CHANNEL
-	 * responses must stay ephemeral or delivery fails.
+	 * Every slash-command answer is ephemeral: the command output is meant
+	 * for the person who ran the command, not for the channel history.
 	 */
-	interactionFlags(interaction) {
-		const context = Number(interaction?.context ?? 0);
-		return context === INTERACTION_CONTEXT.BOT_DM ? null : DISCORD_EPHEMERAL_FLAG;
+	interactionFlags() {
+		return DISCORD_EPHEMERAL_FLAG;
 	}
 
 	/**
@@ -1500,12 +1603,17 @@ export class DiscordBotBridge {
 	async handleApplicationCommand(interaction) {
 		const authorId = String(interaction?.member?.user?.id || interaction?.user?.id || "").trim();
 		const config = this.getConfig();
+		const scope = await this.resolveScope({
+			guildId: interaction?.guild_id,
+			channelId: interaction?.channel_id,
+			config,
+		});
 		if (!isAllowedUser(config, authorId)) {
 			await this.respondToInteraction(interaction, {
 				type: INTERACTION_RESPONSE_TYPE.CHANNEL_MESSAGE_WITH_SOURCE,
 				data: {
 					content: "Access denied. Add your Discord User ID to the bot allowlist in pi-web-ui.",
-					...(this.interactionFlags(interaction) !== null ? { flags: this.interactionFlags(interaction) } : {}),
+					flags: DISCORD_EPHEMERAL_FLAG,
 				},
 			});
 			return;
@@ -1531,7 +1639,7 @@ export class DiscordBotBridge {
 
 		let deferred = false;
 		try {
-			await this.deferInteraction(interaction);
+			await this.deferInteraction(interaction, DISCORD_EPHEMERAL_FLAG);
 			deferred = true;
 		} catch (error) {
 			this.log("warn", `Discord interaction defer failed: ${error?.message || error}`);
@@ -1539,8 +1647,12 @@ export class DiscordBotBridge {
 
 		let args = "";
 		if (name === "cwd") args = interactionOption(interaction, "path");
-		if (name === "model") args = interactionOption(interaction, "model");
-		if (name === "thinking") args = interactionOption(interaction, "level");
+		if (name === "model") {
+			args = {
+				model: interactionOption(interaction, "model"),
+				thinking: interactionOption(interaction, "thinking"),
+			};
+		}
 		if (name === "system") {
 			args = {
 				replace: interactionOption(interaction, "replace"),
@@ -1549,18 +1661,24 @@ export class DiscordBotBridge {
 		}
 
 		try {
-			const content = await this.executeCommand(name, args, { authorId, config });
+			const content = await this.executeCommand(name, args, { authorId, config, scope });
 			const finalContent = content || `Unknown command: /${name}`;
-			if (deferred) await this.sendInteractionContent(interaction, finalContent, { edit: true });
-			else await this.sendInteractionContent(interaction, finalContent);
+			if (deferred) {
+				await this.sendInteractionContent(interaction, finalContent, {
+					edit: true,
+					flags: DISCORD_EPHEMERAL_FLAG,
+				});
+			} else {
+				await this.sendInteractionContent(interaction, finalContent, { flags: DISCORD_EPHEMERAL_FLAG });
+			}
 		} catch (error) {
 			const finalContent = `Command failed: ${error?.message || error}`;
 			if (deferred) {
-				await this.editInteractionResponse(interaction, finalContent).catch(() => {});
+				await this.editInteractionResponse(interaction, finalContent, DISCORD_EPHEMERAL_FLAG).catch(() => {});
 			} else {
 				await this.respondToInteraction(interaction, {
 					type: INTERACTION_RESPONSE_TYPE.CHANNEL_MESSAGE_WITH_SOURCE,
-					data: { content: finalContent, ...(this.interactionFlags(interaction) !== null ? { flags: this.interactionFlags(interaction) } : {}) },
+					data: { content: finalContent, flags: DISCORD_EPHEMERAL_FLAG },
 				}).catch(() => {});
 			}
 		}
@@ -1747,12 +1865,24 @@ export class DiscordBotBridge {
 		this.status.messagesReceived += 1;
 		this.status.lastMessageAt = Date.now();
 
-		const run = this.createRun({ channelId, authorId, interaction: deferred ? interaction : null });
+		const scope = await this.resolveScope({
+			guildId: interaction?.guild_id,
+			channelId,
+			config,
+		});
+		const run = this.createRun({
+			channelId,
+			authorId,
+			interaction: deferred ? interaction : null,
+			isGuild: Boolean(interaction?.guild_id),
+			scope,
+		});
 		const request = await this.buildRequest({
 			text: prompt,
 			config,
 			replyContext: context.text,
 			authorId,
+			scope,
 			// /pi already reads this channel itself, so the loaded batch of the
 			// same channel is skipped to avoid repeating the same messages.
 			excludeContextChannelId: channelId,
@@ -1803,7 +1933,7 @@ export class DiscordBotBridge {
 		return this.getModelCatalog(true);
 	}
 
-	async executeCommand(name, args = "", { authorId = "", config = this.getConfig() } = {}) {
+	async executeCommand(name, args = "", { authorId = "", config = this.getConfig(), scope = "dm" } = {}) {
 		const command = String(name || "").toLowerCase();
 		const argument = typeof args === "string" ? String(args || "").trim() : "";
 		const optionPayload = args && typeof args === "object" ? args : {};
@@ -1815,11 +1945,12 @@ export class DiscordBotBridge {
 				"- `/help` — show this help.",
 				"- `/status` — show gateway, counters, and command registration status.",
 				"- `/new` — start a fresh conversation.",
-				"- `/clear` — clear the current conversation context (alias of `/new`).",
+				"- `/new` — start a fresh conversation (clears the stored session id).",
+				"- `/clear` — alias of `/new`; both drop the stored session id.",
 				"- `/cancel` — cancel the running task.",
 				"- `/cwd [path]` — show or change the workspace directory.",
-				"- `/model [provider/model]` — show or change the AI model.",
-				"- `/thinking [off|low|medium|high|max]` — show or change the thinking level.",
+				"- `/model [provider/model] [thinking]` — show or change the AI model and the thinking level.",
+				"- `/model high` — only change the thinking level (off, low, medium, high, max).",
 				"- `/system` — show the current Discord core system prompt.",
 				"- `/system replace <text>` — replace the core system prompt.",
 				"- `/system append <text>` — append to the core system prompt.",
@@ -1844,6 +1975,11 @@ export class DiscordBotBridge {
 			const guilds = status.registeredGuilds.length
 				? status.registeredGuilds.join(", ")
 				: "none yet";
+			const key = this.sessionKeyFor(scope, authorId);
+			const sessionId =
+				this.activeConversationFor(key) ||
+				String(this.userSessions.get(key)?.conversationId || "").trim() ||
+				"(none yet)";
 			return [
 				"### Discord bot status",
 				`- Bot: @${status.botUsername || "not connected"}`,
@@ -1852,24 +1988,36 @@ export class DiscordBotBridge {
 				`- Native commands registered: ${status.registeredCommands}`,
 				`- Guilds with registered commands: ${guilds}`,
 				`- Global commands registered: ${this.status.registeredGlobally ? "yes" : "no"}`,
-				`- User install: https://discord.com/oauth2/authorize?client_id=${this.applicationId || "CLIENT_ID"}&integration_type=1&scope=applications.commands`,
+				`- User install: https://discord.com/oauth2/authorize?bot_id=${this.applicationId || "CLIENT_ID"}&integration_type=1&scope=applications.commands`,
 				`- Messages received: ${status.messagesReceived}`,
 				`- Replies sent: ${status.messagesReplied}`,
+				"",
+				"### This user",
+				`- Discord user: ${authorId || "unknown"}`,
+				`- Scope: \`${scope}\``,
+				`- Pi session id: \`${sessionId}\``,
+				`- Session account: \`${this.userAccountId(key)}\``,
 				`- Workspace: ${workspace || "(host default)"}`,
 				`- Model: ${config.model || "(host default)"}`,
 				`- Thinking level: ${config.thinkingLevel || "(host default)"}`,
+				`- Automatic replies: ${config.autoReplyEnabled ? "on" : "off"}`,
 				`- Automatic reply channels: ${autoReplyChannels(config).join(", ") || "none"}`,
 				`- Workspace session reuse: ${config.useWorkspaceSession === false ? "off" : "on"}`,
+				`- Tool trace: ${config.showToolCalls ? "on" : "off"}`,
+				`- Live replies: ${config.liveReplyEnabled ? "on" : "off"}`,
+				`- Attachments: ${config.allowAttachments ? "on" : "off"}`,
 			].join("\n");
 		}
 
-		if (command === "new" || command === "clear") {
-			this.resetUserConversation(authorId);
-			return "✨ Conversation context cleared. A fresh session is ready.";
+		if (command === "new") {
+			const key = this.sessionKeyFor(scope, authorId);
+			await this.resetUserConversation(key, { authorId });
+			return "✨ Conversation context cleared. The stored session id was removed; the next message starts a new session.";
 		}
 
 		if (command === "cancel") {
-			const conversationId = this.activeConversationFor(authorId);
+			const key = this.sessionKeyFor(scope, authorId);
+			const conversationId = this.activeConversationFor(key);
 			if (!conversationId) return "ℹ️ There is no running task to cancel.";
 			for (const run of this.pendingRuns.values()) {
 				if (run.authorId === authorId) run.cancelled = true;
@@ -1895,48 +2043,55 @@ export class DiscordBotBridge {
 			if (!stat?.isDirectory?.()) return `❌ Workspace is not a directory: ${targetPath}`;
 			this.userWorkspaces.set(authorId, targetPath);
 			await this.persistUserWorkspaces(Object.fromEntries(this.userWorkspaces));
-			this.resetUserConversation(authorId);
+			await this.resetUserConversation(this.sessionKeyFor(scope, authorId), { authorId });
 			return `📂 Workspace changed to: ${targetPath}\n✨ A fresh session was created for the new workspace.`;
 		}
 
 		if (command === "model") {
-			if (!argument) {
+			let requested;
+			if (typeof args === "object" && args !== null) {
+				const rawThinking = String(optionPayload.thinking || "").trim();
+				const isReset = ["default", "host", "none", "reset"].includes(rawThinking.toLowerCase());
+				const level = rawThinking && !isReset ? normalizeThinkingLevel(rawThinking) : "";
+				requested = {
+					model: String(optionPayload.model || "").trim(),
+					thinking: level,
+					thinkingReset: isReset,
+					invalid: rawThinking && !level && !isReset ? rawThinking : "",
+				};
+			} else {
+				requested = parseModelArguments(argument);
+			}
+			if (requested.invalid) {
+				return `❌ Unknown option: ${requested.invalid}\nUse \`/model provider/model\` or \`/model ${THINKING_LEVELS.join("|")}\`.`;
+			}
+			const wantsShow = !requested.model && !requested.thinking && !requested.thinkingReset;
+			if (wantsShow) {
 				return [
 					"### Current AI configuration",
 					`- Model: \`${config.model || "(host default)"}\``,
 					`- Thinking level: \`${config.thinkingLevel || "(host default)"}\``,
 					"Use `/model provider/model` to change the model.",
-					"Use `/thinking off|low|medium|high|max` to change the thinking level.",
+					`Use \`/model ${THINKING_LEVELS.join("|")}\` to change the thinking level.`,
 				].join("\n");
 			}
-			const catalog = await this.getModelCatalog();
-			if (catalog.length > 0 && !catalog.includes(argument)) {
-				return `❌ Unknown model: ${argument}\nUse the autocomplete list or check the configured model IDs.`;
+			const changed = [];
+			if (requested.model) {
+				const catalog = await this.getModelCatalog();
+				if (catalog.length > 0 && !catalog.includes(requested.model)) {
+					return `❌ Unknown model: ${requested.model}\nUse the autocomplete list or check the configured model IDs.`;
+				}
+				await this.updateConfig({ model: requested.model });
+				changed.push(`AI model changed to: ${requested.model}`);
 			}
-			await this.updateConfig({ model: argument });
-			return `✨ AI model changed to: ${argument}`;
-		}
-
-		if (command === "thinking") {
-			if (!argument) {
-				return [
-					"### Current AI configuration",
-					`- Model: \`${config.model || "(host default)"}\``,
-					`- Thinking level: \`${config.thinkingLevel || "(host default)"}\``,
-					`Use \`/thinking ${THINKING_LEVELS.join("|")}\` to change the thinking level.`,
-				].join("\n");
-			}
-			const raw = argument.toLowerCase();
-			if (["default", "host", "none", "reset"].includes(raw)) {
+			if (requested.thinking) {
+				await this.updateConfig({ thinkingLevel: requested.thinking });
+				changed.push(`Thinking level changed to: ${requested.thinking}`);
+			} else if (requested.thinkingReset) {
 				await this.updateConfig({ thinkingLevel: "" });
-				return "✨ Thinking level reset to the host default.";
+				changed.push("Thinking level reset to the host default.");
 			}
-			const level = normalizeThinkingLevel(argument);
-			if (!level) {
-				return `❌ Unknown thinking level: ${argument}\nUse one of: ${THINKING_LEVELS.join(", ")}.`;
-			}
-			await this.updateConfig({ thinkingLevel: level });
-			return `✨ Thinking level changed to: ${level}`;
+			return changed.map((line) => `✨ ${line}`).join("\n");
 		}
 
 		if (command === "system") {
@@ -1979,11 +2134,11 @@ export class DiscordBotBridge {
 	}
 
 	/** The conversation a user is currently bound to (running run first, then last used). */
-	activeConversationFor(authorId) {
+	activeConversationFor(key) {
 		for (const run of this.pendingRuns.values()) {
-			if (run.authorId === authorId && run.conversationId) return run.conversationId;
+			if (run.sessionKey === key && run.conversationId) return run.conversationId;
 		}
-		return String(this.userConversations.get(authorId) || "").trim();
+		return String(this.userConversations.get(key) || "").trim();
 	}
 
 	/**
@@ -1992,6 +2147,72 @@ export class DiscordBotBridge {
 	 * Returning its id lets the host steer that exact session, so Discord and the
 	 * browser share one pi session even while it is open in pi-web-ui.
 	 */
+	/**
+	 * The scope of a conversation: a DM or a guild channel.
+	 *
+	 * A thread continues the conversation of the channel it was started in, so
+	 * the parent channel decides the scope.
+	 */
+	async resolveScope({ guildId = "", channelId = "", config = this.getConfig() } = {}) {
+		const guild = String(guildId || "").trim();
+		if (!guild) return "dm";
+		const channel = String(channelId || "").trim();
+		const info = await this.resolveChannelInfo(channel, config);
+		const root = info?.parentId || channel;
+		return sessionScope({ guildId: guild, channelId: root });
+	}
+
+	/** The session key of one user in one scope. */
+	sessionKeyFor(scope, authorId) {
+		return sessionKey(scope, authorId);
+	}
+
+	/** Metadata of a Discord channel, cached for a minute. */
+	async resolveChannelInfo(channelId, config = this.getConfig()) {
+		const id = String(channelId || "").trim();
+		if (!id) return null;
+		const cached = this.channelInfoCache.get(id);
+		if (cached && cached.expiresAt > Date.now()) return cached.info;
+		try {
+			const data = await this.api(config?.botToken, "GET", `/channels/${id}`);
+			const info = {
+				type: Number(data?.type || 0),
+				parentId: String(data?.parent_id || "").trim(),
+				name: String(data?.name || "").trim(),
+			};
+			this.channelInfoCache.set(id, { info, expiresAt: Date.now() + CHANNEL_INFO_CACHE_MS });
+			return info;
+		} catch {
+			return null;
+		}
+	}
+
+	/** Remember a message the bot posted, so a thread started from it is found. */
+	rememberBotMessage(message) {
+		const id = String(message?.id || "").trim();
+		if (!id) return;
+		this.botMessageIds.add(id);
+		while (this.botMessageIds.size > BOT_MESSAGE_MEMORY) {
+			const oldest = this.botMessageIds.values().next().value;
+			this.botMessageIds.delete(oldest);
+		}
+	}
+
+	/**
+	 * Enable automatic replies in a thread that was started from a bot reply.
+	 *
+	 * The setting lives in memory only: it follows the default channel
+	 * automatic-reply switch and never changes the stored configuration.
+	 */
+	enableThreadAutoReply(threadId, parentMessageId = "") {
+		const thread = String(threadId || "").trim();
+		const parent = String(parentMessageId || "").trim();
+		if (!thread || !parent) return false;
+		if (!this.botMessageIds.has(parent)) return false;
+		this.autoReplyThreadIds.add(thread);
+		return true;
+	}
+
 	async resolveWorkspaceConversation(authorId, config = this.getConfig()) {
 		if (config?.useWorkspaceSession === false) return "";
 		const workspace = await this.resolveWorkspace(authorId, config);
@@ -2051,17 +2272,62 @@ export class DiscordBotBridge {
 		if (run) run.lastError = text;
 	}
 
+	/**
+	 * Handle a new Discord thread.
+	 *
+	 * A thread that starts from one of the bot's replies answers automatically.
+	 * The switch lives in memory only and follows the default automatic-reply
+	 * setting of the parent channel.
+	 */
+	async onThreadCreate(thread) {
+		const threadId = String(thread?.id || "").trim();
+		if (!threadId) return;
+		const config = this.getConfig();
+		const parentChannelId = String(thread?.parent_id || "").trim();
+		const starter = thread?.message || null;
+		const starterId = String(starter?.id || "").trim();
+		const botId = String(this.botUser?.id || this.status.botUserId || "").trim();
+		const starterAuthorId = String(starter?.author?.id || "").trim();
+		const startedFromBot =
+			Boolean(starterId) &&
+			((botId && starterAuthorId === botId) || this.botMessageIds.has(starterId));
+		const parentAutoReply = Boolean(parentChannelId) && isAutoReplyChannel(parentChannelId, config);
+		if (!startedFromBot && !parentAutoReply) return;
+		if (startedFromBot) {
+			if (starterId) this.rememberBotMessage(starter);
+			this.enableThreadAutoReply(threadId, starterId);
+		} else if (parentAutoReply) {
+			this.autoReplyThreadIds.add(threadId);
+		}
+		if (this.autoReplyThreadIds.has(threadId)) {
+			this.log("info", `Automatic replies enabled for thread ${threadId}`);
+		}
+	}
+
 	async onInboundMessage(message) {
 		if (!message || message.author?.bot) return;
 
-		const channelId = String(message.channel_id || "").trim();
 		const authorId = String(message.author?.id || "").trim();
+		const channelId = String(message.channel_id || "").trim();
 		const botId = String(this.botUser?.id || "").trim();
 		const isGuild = Boolean(message.guild_id);
 		const config = this.getConfig();
+		const scope = await this.resolveScope({
+			guildId: message.guild_id,
+			channelId,
+			config,
+		});
 
 		const referencedMessage = await this.resolveReferencedMessage(message, config);
-		if (isGuild && !isMessageAddressedToBot(message, { botId, config, referencedMessage })) {
+		if (
+			isGuild &&
+			!isMessageAddressedToBot(message, {
+				botId,
+				config,
+				referencedMessage,
+				autoReplyThreadIds: this.autoReplyThreadIds,
+			})
+		) {
 			return;
 		}
 
@@ -2071,7 +2337,7 @@ export class DiscordBotBridge {
 		if (!isAllowedUser(config, authorId)) {
 			await this.api(config.botToken, "POST", `/channels/${channelId}/messages`, {
 				content: "Access denied. Add your Discord User ID to the bot allowlist in pi-web-ui.",
-				message_reference: { message_id: message.id },
+				...(isGuild ? { message_reference: { message_id: message.id } } : {}),
 			}).catch(() => {});
 			return;
 		}
@@ -2081,7 +2347,14 @@ export class DiscordBotBridge {
 
 		const parsed = parseLegacyCommand(cleanText);
 		if (parsed && DISCORD_COMMANDS.some((command) => command.type === 1 && command.name === parsed.name)) {
-			await this.handleLegacyCommand(parsed, { channelId, authorId, replyToId: message.id, config });
+			await this.handleLegacyCommand(parsed, {
+				channelId,
+				authorId,
+				replyToId: message.id,
+				config,
+				scope,
+				isGuild,
+			});
 			return;
 		}
 
@@ -2089,8 +2362,15 @@ export class DiscordBotBridge {
 
 		const replyContext = buildReplyContext(referencedMessage, { botId });
 		const attachments = await this.collectAttachmentContext(message, { config, authorId });
-		const run = this.createRun({ channelId, authorId, replyToMessageId: message.id });
-		const request = await this.buildRequest({ text: cleanText, config, replyContext, authorId, attachments });
+		const run = this.createRun({ channelId, authorId, replyToMessageId: message.id, isGuild, scope });
+		const request = await this.buildRequest({
+			text: cleanText,
+			config,
+			replyContext,
+			authorId,
+			attachments,
+			scope,
+		});
 
 		await this.enqueueDispatch(run, request);
 	}
@@ -2103,11 +2383,22 @@ export class DiscordBotBridge {
 	 * channel message, which is the only channel a user-installed app can use
 	 * in a third-party DM.
 	 */
-	createRun({ channelId = "", authorId = "", replyToMessageId = "", interaction = null } = {}) {
-		const generation = Number(this.userGenerations.get(authorId) || 0);
+	createRun({
+		channelId = "",
+		authorId = "",
+		replyToMessageId = "",
+		interaction = null,
+		isGuild = false,
+		scope = "dm",
+	} = {}) {
+		const sessionKey = this.sessionKeyFor(scope, authorId);
+		const generation = Number(this.userGenerations.get(sessionKey) || 0);
 		const run = {
 			channelId,
 			authorId,
+			isGuild,
+			scope,
+			sessionKey,
 			replyToMessageId,
 			interaction,
 			accumulatedText: "",
@@ -2152,8 +2443,10 @@ export class DiscordBotBridge {
 		authorId = "",
 		excludeContextChannelId = "",
 		attachments = "",
+		scope = "dm",
 	} = {}) {
-		const accountId = this.userAccountId(authorId);
+		const key = this.sessionKeyFor(scope, authorId);
+		const accountId = this.userAccountId(key);
 		const botId = String(this.botUser?.id || "");
 		const loadedContext = formatLoadedContext(
 			this.loadedBatches(authorId, { excludeChannelId: excludeContextChannelId }),
@@ -2174,15 +2467,23 @@ export class DiscordBotBridge {
 		if (workspace) request.cwd = workspace;
 		if (config.model) request.model = config.model;
 		if (config.thinkingLevel) request.thinkingLevel = config.thinkingLevel;
-		const sessionTarget = await this.resolveWorkspaceConversation(authorId, config);
+		const sessionTarget = await this.resolveSessionTarget({ key, scope, authorId, config });
 		if (sessionTarget) request.conversationId = sessionTarget;
 		return request;
 	}
 
-	async handleLegacyCommand(parsed, { channelId, authorId, replyToId, config }) {
+	async handleLegacyCommand(parsed, { channelId, authorId, replyToId, config, scope = "dm", isGuild = false }) {
 		try {
 			if (parsed.name === "pi") {
-				await this.runLegacyPrompt({ text: parsed.args, channelId, authorId, replyToId, config });
+				await this.runLegacyPrompt({
+					text: parsed.args,
+					channelId,
+					authorId,
+					replyToId,
+					config,
+					scope,
+					isGuild,
+				});
 				return true;
 			}
 			if (parsed.name === "read") {
@@ -2237,17 +2538,21 @@ export class DiscordBotBridge {
 				await this.postChannelText(channelId, config, lines, replyToId);
 				return true;
 			}
-			const content = await this.executeCommand(parsed.name, parsed.args, { authorId, config });
+			const content = await this.executeCommand(parsed.name, parsed.args, {
+				authorId,
+				config,
+				scope,
+			});
 			if (content === null) return false;
 			await this.api(config.botToken, "POST", `/channels/${channelId}/messages`, {
 				content,
-				message_reference: replyToId ? { message_id: replyToId } : undefined,
+				...(isGuild && replyToId ? { message_reference: { message_id: replyToId } } : {}),
 			});
 			return true;
 		} catch (error) {
 			await this.api(config.botToken, "POST", `/channels/${channelId}/messages`, {
 				content: `Command failed: ${error?.message || error}`,
-				message_reference: replyToId ? { message_id: replyToId } : undefined,
+				...(isGuild && replyToId ? { message_reference: { message_id: replyToId } } : {}),
 			}).catch(() => {});
 			return true;
 		}
@@ -2258,11 +2563,11 @@ export class DiscordBotBridge {
 	 *
 	 * Long text is split so nothing is silently truncated.
 	 */
-	async postChannelText(channelId, config = this.getConfig(), content = "", replyToId = "") {
+	async postChannelText(channelId, config = this.getConfig(), content = "", replyToId = "", { isGuild = true } = {}) {
 		for (const chunk of chunkMarkdownText(content, DISCORD_MESSAGE_LIMIT)) {
 			await this.api(config?.botToken, "POST", `/channels/${channelId}/messages`, {
 				content: chunk,
-				message_reference: replyToId ? { message_id: replyToId } : undefined,
+				...(isGuild && replyToId ? { message_reference: { message_id: replyToId } } : {}),
 			});
 		}
 	}
@@ -2270,18 +2575,32 @@ export class DiscordBotBridge {
 	/**
 	 * Run a prompt typed as plain text (`/pi ...` without picking the command).
 	 */
-	async runLegacyPrompt({ text = "", channelId = "", authorId = "", replyToId = "", config = this.getConfig() } = {}) {
+	async runLegacyPrompt({
+		text = "",
+		channelId = "",
+		authorId = "",
+		replyToId = "",
+		config = this.getConfig(),
+		scope = "dm",
+		isGuild = false,
+	} = {}) {
 		const prompt = String(text || "").trim();
 		if (!prompt) {
 			await this.api(config.botToken, "POST", `/channels/${channelId}/messages`, {
 				content: "❌ `/pi` needs a message to send to the agent.",
-				message_reference: replyToId ? { message_id: replyToId } : undefined,
+				...(isGuild && replyToId ? { message_reference: { message_id: replyToId } } : {}),
 			}).catch(() => {});
 			return;
 		}
 		const context = await this.buildChannelContext(channelId, DISCORD_READ_DEFAULT_COUNT, config);
-		const run = this.createRun({ channelId, authorId, replyToMessageId: replyToId });
-		const request = await this.buildRequest({ text: prompt, config, replyContext: context.text, authorId });
+		const run = this.createRun({ channelId, authorId, replyToMessageId: replyToId, isGuild, scope });
+		const request = await this.buildRequest({
+			text: prompt,
+			config,
+			replyContext: context.text,
+			authorId,
+			scope,
+		});
 		await this.enqueueDispatch(run, request);
 	}
 
@@ -2319,7 +2638,7 @@ export class DiscordBotBridge {
 			if (!conversationId) throw new Error("pi-web-ui did not return a conversation ID");
 
 			run.conversationId = conversationId;
-			this.userConversations.set(run.authorId, conversationId);
+			await this.rememberUserSession(run.sessionKey, conversationId);
 			if (!run.finished) this.pendingRuns.set(conversationId, run);
 
 			const early = this.earlyRuns.get(conversationId);
@@ -2529,17 +2848,19 @@ export class DiscordBotBridge {
 		try {
 			for (let index = 0; index < chunks.length; index++) {
 				const payload = { content: chunks[index] };
-				if (index === 0 && run.replyToMessageId) {
+				if (index === 0 && run.replyToMessageId && run.isGuild !== false) {
 					payload.message_reference = { message_id: run.replyToMessageId };
 				}
 				try {
-					await this.api(config.botToken, "POST", `/channels/${run.channelId}/messages`, payload);
+					const message = await this.api(config.botToken, "POST", `/channels/${run.channelId}/messages`, payload);
+					if (message?.id) this.rememberBotMessage(message);
 				} catch (error) {
 					// A stale or malformed reply reference must never swallow the
 					// answer: post the same chunk again without the reference.
 					if (index === 0 && payload.message_reference) {
 						delete payload.message_reference;
-						await this.api(config.botToken, "POST", `/channels/${run.channelId}/messages`, payload);
+						const message = await this.api(config.botToken, "POST", `/channels/${run.channelId}/messages`, payload);
+						if (message?.id) this.rememberBotMessage(message);
 					} else {
 						throw error;
 					}
@@ -2556,13 +2877,19 @@ export class DiscordBotBridge {
 	/** Post the live reply message (the first page of a streamed answer). */
 	async postLiveMessage(run, config, content) {
 		const payload = { content: String(content || "") };
-		if (!run.liveMessageId && run.replyToMessageId) {
+		// DMs get plain messages: a reply reference in a DM is noise and can be
+		// rejected by Discord. Guild channels keep the reply behaviour.
+		if (!run.liveMessageId && run.replyToMessageId && run.isGuild !== false) {
 			payload.message_reference = { message_id: run.replyToMessageId };
 		}
 		try {
 			const message = await this.api(config.botToken, "POST", `/channels/${run.channelId}/messages`, payload);
 			this.status.messagesReplied += 1;
 			this.status.lastReplyAt = Date.now();
+			if (message?.id) {
+				run.liveMessageId = String(message.id);
+				this.rememberBotMessage(message);
+			}
 			return message;
 		} catch (error) {
 			// A stale or malformed reply reference must never swallow the answer.
@@ -2571,6 +2898,10 @@ export class DiscordBotBridge {
 				const message = await this.api(config.botToken, "POST", `/channels/${run.channelId}/messages`, payload);
 				this.status.messagesReplied += 1;
 				this.status.lastReplyAt = Date.now();
+				if (message?.id) {
+					run.liveMessageId = String(message.id);
+					this.rememberBotMessage(message);
+				}
 				return message;
 			}
 			throw error;

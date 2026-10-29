@@ -43,7 +43,7 @@ export default {
 							</div>
 						</div>
 						<div class="discord-metric-commands" style="margin-top: 10px; font-size: 12px; color: var(--text-dim); line-height: 1.5;">
-							Native commands: <code>/help</code>, <code>/status</code>, <code>/new</code>, <code>/clear</code>, <code>/cancel</code>, <code>/cwd</code>, <code>/model</code>, <code>/thinking</code>, <code>/system</code>, <code>/context</code>, <code>/read</code>, and <code>/pi</code>. The <code>/cwd</code> and <code>/model</code> options support autocomplete. Commands are registered globally and per guild, so they also work in DMs when the app is installed to a user account.
+							Native commands: <code>/help</code>, <code>/status</code>, <code>/new</code>, <code>/cancel</code>, <code>/cwd</code>, <code>/model</code>, <code>/system</code>, <code>/context</code>, <code>/read</code>, and <code>/pi</code>. <code>/model</code> takes an optional model and an optional thinking level. The <code>/cwd</code> and <code>/model</code> options support autocomplete. Commands are registered globally and per guild, so they also work in DMs when the app is installed to a user account.
 							<br />
 							<code>/read [count]</code> loads the last messages of the current channel into the chat context without starting a turn, and <code>/pi <message> [context]</code> sends a prompt to the agent just like an <code>@mention</code> — which is the way to talk to it in a personal DM. The <code>context</code> option of <code>/pi</code> sets how many recent channel messages are included (default 5).
 							<br />
@@ -285,6 +285,7 @@ export default {
 						`Tool trace: ${config.showToolCalls ? "on" : "off"}`,
 						`Live streaming: ${config.liveReplyEnabled ? "on" : "off"}`,
 						`Attachments: ${config.allowAttachments ? "on" : "off"}`,
+						`Stored sessions: ${Number(state.botStatus?.storedSessions || 0)}`,
 					].join(" · ");
 				}
 			} catch (error) {

@@ -92,24 +92,36 @@ test("thinking levels are normalized and exposed as native command choices", () 
 	assert.equal(normalizeThinkingLevel("medium"), "medium");
 	assert.equal(normalizeThinkingLevel("default"), "");
 	assert.equal(normalizeThinkingLevel("turbo"), "");
+	// The thinking level lives inside /model; there is no /thinking command.
 	const thinking = DISCORD_COMMANDS.find((command) => command.name === "thinking");
-	assert.ok(thinking);
+	assert.equal(thinking, undefined);
+	const model = DISCORD_COMMANDS.find((command) => command.name === "model");
 	assert.deepEqual(
-		thinking.options[0].choices.map((choice) => choice.value),
+		model.options[1].choices.map((choice) => choice.value),
 		["off", "low", "medium", "high", "max"],
 	);
 });
 
-test("/thinking changes the persisted thinking level and rejects unknown values", async () => {
+test("/model changes the thinking level and rejects unknown values", async () => {
 	const harness = createHarness();
-	await harness.bridge.onInboundMessage(message("/thinking high"));
+	await harness.bridge.onInboundMessage(message("/model high"));
 	assert.equal(harness.config.thinkingLevel, "high");
-	await harness.bridge.onInboundMessage(message("/thinking turbo"));
+	await harness.bridge.onInboundMessage(message("/model turbo"));
 	assert.equal(harness.config.thinkingLevel, "high");
-	await harness.bridge.onInboundMessage(message("/thinking default"));
+	await harness.bridge.onInboundMessage(message("/model default"));
 	assert.equal(harness.config.thinkingLevel, "");
 	const reply = harness.apiCalls.filter((call) => call.method === "POST").at(-1);
 	assert.match(reply.payload.content, /Thinking level/);
+});
+
+test("/model sets the model and the thinking level in one call", async () => {
+	const harness = createHarness({ models: [{ id: "openai/gpt-5" }] });
+	await harness.bridge.onInboundMessage(message("/model openai/gpt-5 max"));
+	assert.equal(harness.config.model, "openai/gpt-5");
+	assert.equal(harness.config.thinkingLevel, "max");
+	const reply = harness.apiCalls.filter((call) => call.method === "POST").at(-1);
+	assert.match(reply.payload.content, /AI model changed to: openai\/gpt-5/);
+	assert.match(reply.payload.content, /Thinking level changed to: max/);
 });
 
 test("/system replaces and appends the core prompt and rejects both options at once", async () => {
@@ -205,7 +217,9 @@ test("a missing referenced message is fetched from the Discord API", async () =>
 			message_reference: { message_id: "message-42", channel_id: CHANNEL_ID },
 		}),
 	);
-	const lookup = harness.apiCalls.find((call) => call.method === "GET");
+	const lookup = harness.apiCalls.find(
+		(call) => call.method === "GET" && call.path.includes("/messages/message-42"),
+	);
 	assert.equal(lookup.path, `/channels/${CHANNEL_ID}/messages/message-42`);
 	const context = buildReplyContext({ author: { id: "42", username: "alice" }, content: "hello" });
 	assert.match(context, /Replying to @alice \(42\):\nhello/);
@@ -288,7 +302,7 @@ test("/cancel aborts the running task of the invoking user", async () => {
 		aborted = conversationId;
 		return { ok: true };
 	};
-	harness.bridge.userConversations.set(AUTHOR_ID, "c5");
+	harness.bridge.userConversations.set(`guild:guild-1:${CHANNEL_ID}|${AUTHOR_ID}`, "c5");
 	await harness.bridge.onInboundMessage(message("/cancel"));
 	assert.equal(aborted, "c5");
 	const reply = harness.apiCalls.filter((call) => call.method === "POST").at(-1);
