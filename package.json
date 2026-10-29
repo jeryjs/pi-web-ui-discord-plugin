@@ -1,6 +1,6 @@
 {
   "name": "pi-web-ui-discord-plugin",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "description": "Standalone English-first Discord plugin for pi-web-ui",
   "private": true,
   "type": "module",

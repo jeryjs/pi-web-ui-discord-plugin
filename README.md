@@ -9,6 +9,7 @@ The plugin has **no runtime npm dependencies** and uses Node's built-in `fetch`,
 - Native Discord Gateway connection with no public IP or reverse proxy
 - Per-user persistent pi-web-ui conversations
 - Reliable reply routing back to the originating Discord channel
+- A typing indicator that follows the agent: it starts when the turn is dispatched, is refreshed while the agent works, and stops as soon as the answer is visible
 - Persistent sessions per user **and** per scope (DM and guild channel are never mixed)
 - Stored session IDs that survive a pi-web-ui restart
 - Explicit `/new` session reset (`/clear` is a plain-text alias of `/new`)
@@ -118,6 +119,7 @@ The dashboard stores these values:
 | `autoReplyEnabled` | Answers every message in `defaultChannelId` without an @mention. |
 | `autoReplyChannels` | Extra channel IDs that answer every message without an @mention. |
 | `useWorkspaceSession` | Reuses the pi session open in pi-web-ui for the same workspace (default on). |
+| `typingIndicator` | Shows "Pi is typing…" while the agent works (default on). |
 | `showToolCalls` | Adds the agent's thinking steps and tool names to the Discord answer. |
 | `liveReplyEnabled` | Streams the answer into one Discord message that is edited in place. |
 | `allowAttachments` | Downloads files, images, and custom emoji and shows them to the model. |
@@ -154,6 +156,14 @@ the bot's own messages always reaches the bot, even outside those channels.
 **Threads.** A thread that is started from one of the bot's answers answers automatically from then
 on. The switch lives in memory only — the stored configuration is never changed — and it follows the
 automatic-reply setting of the parent channel.
+
+**Typing indicator.** Discord removes a typing indicator ten seconds after the last request, so a
+single request is not enough for a turn that takes longer. The plugin therefore starts the indicator
+when the turn is actually dispatched, refreshes it every eight seconds while the agent works, and
+stops it as soon as the answer is visible - a streamed answer stops it when the live message is
+posted, a normal answer when the reply is sent. The indicator is never left behind a finished
+reply, and a failed refresh never breaks a turn. It can be switched off with
+`typingIndicator: false`.
 
 **Reply context.** When a message is a Discord reply, the referenced message is fetched (Discord only
 embeds it when the bot has it cached) and passed to the agent inside a `<discord_reply_context>` block
@@ -236,6 +246,7 @@ The test suite covers:
 - persistent multi-turn account IDs
 - `/new` generation resets and scope separation between DMs and guild channels
 - `/cwd` and `/model` behavior
+- typing indicator start, refresh, and stop behavior
 - native command definitions and guild registration
 - Discord interaction callbacks and autocomplete
 - allowlist enforcement
