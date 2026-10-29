@@ -159,6 +159,10 @@ export default {
 								</div>
 								<div style="margin-top: 10px;">
 									<div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
+										<input type="checkbox" id="discord-cfg-typing-indicator" class="discord-cfg-typing-indicator" style="cursor: pointer;" />
+										<label for="discord-cfg-typing-indicator" style="font-size: 12px; cursor: pointer; user-select: none;">Show a typing indicator while the agent works</label>
+									</div>
+									<div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
 										<input type="checkbox" id="discord-cfg-show-tool-calls" class="discord-cfg-show-tool-calls" style="cursor: pointer;" />
 										<label for="discord-cfg-show-tool-calls" style="font-size: 12px; cursor: pointer; user-select: none;">Show tool calls and thinking steps while the agent works</label>
 									</div>
@@ -212,6 +216,7 @@ export default {
 		const configAutoReplyChannels = query(".discord-cfg-auto-reply-channels");
 		const configSystemPrompt = query(".discord-cfg-system-prompt");
 		const configWorkspaceSession = query(".discord-cfg-workspace-session");
+		const configTypingIndicator = query(".discord-cfg-typing-indicator");
 		const configShowToolCalls = query(".discord-cfg-show-tool-calls");
 		const configLiveReply = query(".discord-cfg-live-reply");
 		const configAllowAttachments = query(".discord-cfg-allow-attachments");
@@ -282,6 +287,7 @@ export default {
 						`Core prompt: ${config.systemPrompt ? config.systemPromptMode || "replace" : "built-in"}`,
 						`Automatic reply channels: ${automatic}`,
 						`Workspace session reuse: ${config.useWorkspaceSession === false ? "off" : "on"}`,
+						`Typing indicator: ${config.typingIndicator === false ? "off" : "on"}`,
 						`Tool trace: ${config.showToolCalls ? "on" : "off"}`,
 						`Live streaming: ${config.liveReplyEnabled ? "on" : "off"}`,
 						`Attachments: ${config.allowAttachments ? "on" : "off"}`,
@@ -320,6 +326,7 @@ export default {
 				: "";
 			configSystemPrompt.value = config.systemPrompt || "";
 			configWorkspaceSession.checked = config.useWorkspaceSession !== false;
+			configTypingIndicator.checked = config.typingIndicator !== false;
 			configShowToolCalls.checked = Boolean(config.showToolCalls);
 			configLiveReply.checked = Boolean(config.liveReplyEnabled);
 			configAllowAttachments.checked = Boolean(config.allowAttachments);
@@ -401,6 +408,7 @@ export default {
 				systemPrompt: configSystemPrompt.value.trim(),
 				systemPromptMode: configSystemPrompt.value.trim() ? "replace" : "",
 				useWorkspaceSession: Boolean(configWorkspaceSession.checked),
+				typingIndicator: Boolean(configTypingIndicator.checked),
 				showToolCalls: Boolean(configShowToolCalls.checked),
 				liveReplyEnabled: Boolean(configLiveReply.checked),
 				allowAttachments: Boolean(configAllowAttachments.checked),

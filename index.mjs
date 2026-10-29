@@ -14,7 +14,7 @@ import { chunkMarkdownText } from "./markdown-chunks.mjs";
 export const SECRET_BOT_TOKEN = "discord.botToken";
 
 export const DISCORD_API_BASE = "https://discord.com/api/v10";
-export const PLUGIN_VERSION = "1.6.0";
+export const PLUGIN_VERSION = "1.7.0";
 
 export const DISCORD_INTENTS = Object.freeze({
 	GUILDS: 1 << 0,
@@ -241,6 +241,14 @@ const EVENT_CLOCK_SKEW_MS = 2_000;
 const SHARED_RUN_SETTLE_MS = 2_500;
 /** Minimum delay between Discord message edits (Discord allows ~5 edits / 5s). */
 const LIVE_EDIT_MIN_INTERVAL_MS = 1_200;
+/**
+ * How often the typing indicator is refreshed.
+ *
+ * Discord drops the indicator 10 seconds after the last request, so a turn
+ * that takes longer has to refresh it. The interval stays below the lifetime
+ * of the indicator and well above the rate limit of the endpoint.
+ */
+const TYPING_REFRESH_INTERVAL_MS = 8_000;
 /** Maximum number of attachments downloaded for a single Discord message. */
 const MAX_ATTACHMENTS = 10;
 /** Maximum size of a single downloaded attachment. */
@@ -1025,6 +1033,7 @@ export class DiscordBotBridge {
 		this.userGenerations = new Map();
 		this.autoReplyThreadIds = new Set();
 		this.botMessageIds = new Set();
+		this.typingIndicators = new Map();
 		this.channelInfoCache = new Map();
 		this.knownGuilds = new Set();
 		this.registeredGuilds = new Set();
@@ -1060,6 +1069,7 @@ export class DiscordBotBridge {
 			knownGuilds: [...this.knownGuilds].sort(),
 			activeRuns: this.pendingRuns.size,
 			storedSessions: this.userSessions.size,
+			typingChannels: this.typingIndicators.size,
 		};
 	}
 
@@ -1241,6 +1251,7 @@ export class DiscordBotBridge {
 
 	async stop() {
 		this.running = false;
+		this.stopAllTypingIndicators();
 		this.status.enabled = false;
 		this.status.connected = false;
 		this.status.state = "idle";
@@ -2003,6 +2014,7 @@ export class DiscordBotBridge {
 				`- Automatic replies: ${config.autoReplyEnabled ? "on" : "off"}`,
 				`- Automatic reply channels: ${autoReplyChannels(config).join(", ") || "none"}`,
 				`- Workspace session reuse: ${config.useWorkspaceSession === false ? "off" : "on"}`,
+				`- Typing indicator: ${config.typingIndicator === false ? "off" : "on"}`,
 				`- Tool trace: ${config.showToolCalls ? "on" : "off"}`,
 				`- Live replies: ${config.liveReplyEnabled ? "on" : "off"}`,
 				`- Attachments: ${config.allowAttachments ? "on" : "off"}`,
@@ -2358,8 +2370,6 @@ export class DiscordBotBridge {
 			return;
 		}
 
-		void this.api(config.botToken, "POST", `/channels/${channelId}/typing`, null).catch(() => {});
-
 		const replyContext = buildReplyContext(referencedMessage, { botId });
 		const attachments = await this.collectAttachmentContext(message, { config, authorId });
 		const run = this.createRun({ channelId, authorId, replyToMessageId: message.id, isGuild, scope });
@@ -2622,6 +2632,8 @@ export class DiscordBotBridge {
 		run.sharedConversation = Boolean(request.conversationId);
 
 		try {
+			// The agent starts working now, so the typing indicator starts here.
+			this.startTypingIndicator(run, this.getConfig());
 			const dispatched = await this.host.chat(request);
 			const conversationId = String(dispatched?.conversationId || "").trim();
 			run.clientId = String(dispatched?.clientId || "").trim();
@@ -2653,6 +2665,7 @@ export class DiscordBotBridge {
 			await run.completion;
 		} catch (error) {
 			this.pendingRuns.delete(run.conversationId);
+			this.stopTypingIndicator(run);
 			const config = this.getConfig();
 			await this.api(config.botToken, "POST", `/channels/${run.channelId}/messages`, {
 				content: `Task failed to start: ${error?.message || error}`,
@@ -2786,6 +2799,8 @@ export class DiscordBotBridge {
 		run.finished = true;
 		if (run.timeoutTimer) clearTimeout(run.timeoutTimer);
 		this.clearRunSettle(run);
+		// The answer is on its way: the typing indicator is not needed anymore.
+		this.stopTypingIndicator(run);
 		if (run.conversationId) this.pendingRuns.delete(run.conversationId);
 		this.earlyRuns.delete(run.conversationId);
 
@@ -2874,6 +2889,65 @@ export class DiscordBotBridge {
 		}
 	}
 
+	/**
+	 * Show the typing indicator of a channel while the agent works.
+	 *
+	 * Discord removes the indicator ten seconds after the last request, so a
+	 * turn that takes longer refreshes it on a heartbeat. The indicator starts
+	 * when the turn is dispatched - not when the message arrives - and is
+	 * stopped as soon as the answer is visible, so it never lingers behind a
+	 * finished reply.
+	 */
+	startTypingIndicator(run, config = this.getConfig()) {
+		if (config?.typingIndicator === false) return false;
+		const channelId = String(run?.channelId || "").trim();
+		if (!channelId) return false;
+		const existing = this.typingIndicators.get(channelId);
+		if (existing) {
+			existing.runs.add(run);
+			return true;
+		}
+		const state = { runs: new Set([run]), timer: null };
+		this.typingIndicators.set(channelId, state);
+		const refresh = async () => {
+			try {
+				await this.api(config.botToken, "POST", `/channels/${channelId}/typing`, null);
+			} catch (error) {
+				// The indicator is cosmetic: a failed refresh must never break a turn.
+				this.log("debug", `Discord typing indicator failed: ${error?.message || error}`);
+			}
+		};
+		void refresh();
+		state.timer = setInterval(() => void refresh(), TYPING_REFRESH_INTERVAL_MS);
+		state.timer.unref?.();
+		return true;
+	}
+
+	/**
+	 * Stop the typing indicator of a run.
+	 *
+	 * The indicator belongs to the channel, so it is only removed once no run
+	 * of that channel is working anymore.
+	 */
+	stopTypingIndicator(run) {
+		const channelId = String(run?.channelId || "").trim();
+		const state = this.typingIndicators.get(channelId);
+		if (!state) return false;
+		state.runs.delete(run);
+		if (state.runs.size > 0) return false;
+		if (state.timer) clearInterval(state.timer);
+		this.typingIndicators.delete(channelId);
+		return true;
+	}
+
+	/** Stop every typing indicator, for example when the plugin shuts down. */
+	stopAllTypingIndicators() {
+		for (const state of this.typingIndicators.values()) {
+			if (state.timer) clearInterval(state.timer);
+		}
+		this.typingIndicators.clear();
+	}
+
 	/** Post the live reply message (the first page of a streamed answer). */
 	async postLiveMessage(run, config, content) {
 		const payload = { content: String(content || "") };
@@ -2890,6 +2964,8 @@ export class DiscordBotBridge {
 				run.liveMessageId = String(message.id);
 				this.rememberBotMessage(message);
 			}
+			// The answer is already visible, so the typing indicator can go.
+			this.stopTypingIndicator(run);
 			return message;
 		} catch (error) {
 			// A stale or malformed reply reference must never swallow the answer.
