@@ -9,21 +9,24 @@ The plugin has **no runtime npm dependencies** and uses Node's built-in `fetch`,
 - Native Discord Gateway connection with no public IP or reverse proxy
 - Per-user persistent pi-web-ui conversations
 - Reliable reply routing back to the originating Discord channel
-- Explicit `/new` and `/clear` session resets
+- Persistent sessions per user **and** per scope (DM and guild channel are never mixed)
+- Stored session IDs that survive a pi-web-ui restart
+- Explicit `/new` session reset (`/clear` is a plain-text alias of `/new`)
+- Automatic replies in threads that start from a bot answer, without touching the stored configuration
 - Native guild application commands:
   - `/help`
   - `/status`
   - `/new`
-  - `/clear`
   - `/cwd [path]`
-  - `/model [provider/model]`
+  - `/model [provider/model] [thinking]`
+- Every slash-command answer is ephemeral: only the agent's own answer stays in the channel
 - Discord autocomplete for `/cwd` directories and `/model` model IDs
 - Backward-compatible plain-text slash commands (for example, `@Nero /help`)
 - Discord user allowlist
 - Encrypted bot-token storage through the pi-web-ui secrets API
 - Structure-aware Markdown reply chunking
 - Optional Discord message-sending AI tool
-- Optional live tool trace (`think -> bash -> read`) while the agent works
+- Optional live tool trace (`` `think → bash → read` ``) while the agent works
 - Optional live-streamed answers that are edited in place instead of posted twice
 - Optional attachment support: files, images, and custom emoji are handed to the model
 - English dashboard, status messages, and documentation
@@ -68,10 +71,9 @@ To install under a different plugin ID, omit `--name discord`. The Discord bot p
 | --- | --- | --- | --- |
 | Help | `/help` | `/help` | Shows command help. |
 | Status | `/status` | `/status` | Shows Gateway, counters, application ID, and guild command registration. |
-| New session | `/new` | `/new` | Clears the user's Discord conversation binding and starts a blank pi session. |
-| Clear session | `/clear` | `/clear` | Alias of `/new`. |
+| New session | `/new` | `/new`, `/clear` | Drops the stored session ID of the current scope; the next message starts a new pi session. `/clear` is the plain-text alias of `/new`. |
 | Workspace | `/cwd [path]` | `/cwd [path]`, `/workspace [path]` | Shows or changes the workspace. Changing it also starts a fresh session. |
-| Model | `/model [provider/model]` | `/model [provider/model]` | Shows or changes the model used for subsequent Discord prompts. |
+| Model | `/model [provider/model] [thinking]` | `/model [provider/model] [thinking]` | Shows or changes the model and the thinking level used for subsequent Discord prompts. Both parts are optional: `/model high` only changes the thinking level, `/model openai/gpt-5 max` changes both. |
 | Read | `/read [count]` | `/read [count]` | Loads the last `count` messages of the current channel (default 5) into the chat context. No agent turn is triggered. |
 | Context | `/context [show\|clear]` | `/context [show\|clear]` | Shows the context loaded with `/read`, or drops it with `clear`. |
 | Prompt | `/pi <message> [context]` | `/pi <message>` | Sends a prompt to the pi agent through the same pipeline as an @mention. The optional `context` option sets how many recent channel messages are included (default 5). |
@@ -82,11 +84,11 @@ To install under a different plugin ID, omit `--name discord`. The Discord bot p
 `/read` does not answer anything by itself: it stores the messages it fetched and confirms with a
 short, dismissable (ephemeral) reply. The stored messages are then carried by **every later
 prompt** — in any channel or DM — until the context is dropped with `/context clear` or the
-conversation is reset with `/new`, `/clear`, or `/cwd`. Re-reading the same channel replaces that
+conversation is reset with `/new` or `/cwd`. Re-reading the same channel replaces that
 channel's batch instead of piling up duplicates.
 
-Because the context belongs to the conversation, it is cleared together with it: `/new`, `/clear`,
-and a `/cwd` change all start from an empty context.
+Because the context belongs to the conversation, it is cleared together with it: `/new` and a `/cwd`
+change both start from an empty context.
 
 `/cwd` and `/model` use Discord autocomplete. Plain-text commands in a guild must mention the bot (for example, `@Nero /status`); direct messages do not require a mention, and channels listed under `autoReplyChannels` (plus the default channel when `autoReplyEnabled` is on) accept every message without a mention.
 
@@ -110,7 +112,7 @@ The dashboard stores these values:
 | `defaultChannelId` | Default channel for dashboard and AI-tool messages. |
 | `workspace` | Default workspace directory. |
 | `model` | Default `provider/model` ID. |
-| `thinkingLevel` | Optional pi thinking level; changed with `/thinking`. |
+| `thinkingLevel` | Optional pi thinking level; changed with `/model <level>`. |
 | `systemPrompt` | The Discord core system prompt; changed with `/system`. |
 | `systemPromptMode` | How the core prompt was last set: `replace` or `append`. |
 | `autoReplyEnabled` | Answers every message in `defaultChannelId` without an @mention. |
@@ -119,10 +121,11 @@ The dashboard stores these values:
 | `showToolCalls` | Adds the agent's thinking steps and tool names to the Discord answer. |
 | `liveReplyEnabled` | Streams the answer into one Discord message that is edited in place. |
 | `allowAttachments` | Downloads files, images, and custom emoji and shows them to the model. |
+| `userSessions` | Stored session IDs per user and scope, written by the plugin itself. |
 
 Per-user `/cwd` overrides are stored under the plugin's `userWorkspaces` storage key. The bot token is never written to plaintext `storage.json`.
 
-## Workspace session reuse, automatic replies, and reply context
+## Sessions, scopes, automatic replies, and reply context
 
 **Permanent session.** By default the bot continues the pi-web-ui conversation that is open for the
 configured workspace: the plugin resolves the live conversation through the host API and passes its
@@ -130,9 +133,27 @@ conversation ID with the prompt, so Discord and the browser share one pi session
 independent ones. When no live session matches the workspace, the bot falls back to its own stable
 per-user pseudo-client session. Turn the behavior off with `useWorkspaceSession: false`.
 
+**Stored session IDs.** Every turn that reaches pi-web-ui returns a conversation ID. The plugin writes
+it into the `userSessions` configuration under the key `<scope>|<discord user id>`, so the same
+conversation is continued after a pi-web-ui restart. `/new` (and its plain-text alias `/clear`)
+removes that entry, and the next message starts a brand-new session whose ID is stored again.
+
+**Scopes.** A scope is either `dm` or `guild:<guild id>:<channel id>`. Threads inherit the scope of
+their parent channel. DMs and guild channels never share a session: a DM session is never continued
+in a guild channel, and a guild session never leaks into a DM. `/status` shows the scope, the active
+pi session ID, and the pseudo-client account of the caller.
+
+**Ephemeral command answers.** Every slash-command answer (`/help`, `/status`, `/new`, `/cwd`,
+`/model`, `/system`, `/context`, `/read`) is ephemeral, so only the person who ran the command sees
+it and the channel history stays clean. The agent's own answer to a prompt stays a normal message.
+
 **Automatic replies.** Set `autoReplyEnabled` (default channel) or list channel IDs in
 `autoReplyChannels` to answer every message in those channels without an @mention. Replying to one of
 the bot's own messages always reaches the bot, even outside those channels.
+
+**Threads.** A thread that is started from one of the bot's answers answers automatically from then
+on. The switch lives in memory only — the stored configuration is never changed — and it follows the
+automatic-reply setting of the parent channel.
 
 **Reply context.** When a message is a Discord reply, the referenced message is fetched (Discord only
 embeds it when the bot has it cached) and passed to the agent inside a `<discord_reply_context>` block
@@ -144,7 +165,7 @@ host-global, and pi-web-ui applies `promptOverrides` globally rather than per co
 Discord core prompt is scoped to Discord turns and stored in the same plugin configuration as
 workspace, model, and thinking level. It is stated **once per conversation**: the first turn of a
 conversation carries it in a `<discord_core_prompt>` block, and it then stays in the transcript
-instead of being repeated in every turn. `/new`, `/clear`, and a `/cwd` change start a new
+instead of being repeated in every turn. `/new` and a `/cwd` change start a new
 conversation, which states it again.
 
 Editing it mid-conversation works too: the next turn carries the new text in a
@@ -195,9 +216,9 @@ All three options are off by default and are toggled in **Settings -> Discord ->
 
 ## Session isolation and reset behavior
 
-Each Discord user receives a stable, privacy-preserving pi-web-ui pseudo-client account ID derived from a SHA-256 hash of the Discord User ID. The account ID, rather than a globally colliding in-memory conversation ID, is used to keep the user's session on the correct headless client.
+Each Discord user receives a stable, privacy-preserving pi-web-ui pseudo-client account ID derived from a SHA-256 hash of the Discord User ID and the session scope. The account ID, rather than a globally colliding in-memory conversation ID, is used to keep the user's session on the correct headless client. A DM and a guild channel therefore use different accounts and different sessions.
 
-`/new`, `/clear`, and a workspace change increment a per-user generation. The generation is appended to the pseudo-client account ID, so the next prompt attaches a new headless client with a blank conversation. Replies from a superseded generation are discarded instead of leaking into the new session.
+`/new` and a workspace change increment a per-scope generation. The generation is appended to the pseudo-client account ID, so the next prompt attaches a new headless client with a blank conversation. Replies from a superseded generation are discarded instead of leaking into the new session.
 
 Discord replies are routed using the conversation ID returned by `host.chat`, with an early-event buffer for the race where a fast model emits output before the dispatch receipt arrives. A reply without a valid channel binding is never posted to `/channels/undefined/messages`.
 
@@ -213,7 +234,7 @@ The test suite covers:
 
 - reply routing and early run events
 - persistent multi-turn account IDs
-- `/new` and `/clear` generation resets
+- `/new` generation resets and scope separation between DMs and guild channels
 - `/cwd` and `/model` behavior
 - native command definitions and guild registration
 - Discord interaction callbacks and autocomplete
