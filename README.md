@@ -9,6 +9,7 @@ The plugin has **no runtime npm dependencies** and uses Node's built-in `fetch`,
 - Native Discord Gateway connection with no public IP or reverse proxy
 - Per-user persistent pi-web-ui conversations
 - Reliable reply routing back to the originating Discord channel
+- Turn ownership through pi-web-ui's stable run ID, so an answer is still delivered when the host moves or renames the conversation while the turn runs
 - A typing indicator that follows the agent: it starts when the turn is dispatched, is refreshed while the agent works, and stops as soon as the answer is visible
 - Persistent sessions per user **and** per scope (DM and guild channel are never mixed)
 - Stored session IDs that survive a pi-web-ui restart
@@ -231,6 +232,8 @@ Each Discord user receives a stable, privacy-preserving pi-web-ui pseudo-client 
 `/new` and a workspace change increment a per-scope generation. The generation is appended to the pseudo-client account ID, so the next prompt attaches a new headless client with a blank conversation. Replies from a superseded generation are discarded instead of leaking into the new session.
 
 Discord replies are routed using the conversation ID returned by `host.chat`, with an early-event buffer for the race where a fast model emits output before the dispatch receipt arrives. A reply without a valid channel binding is never posted to `/channels/undefined/messages`.
+
+The dispatch receipt also carries the stable run ID of the turn, and pi-web-ui stamps every run event of that turn with it. The host may move a conversation to another client session or rename it while the turn is running: the conversation ID changes then, while the run ID stays the same. The plugin therefore indexes its pending runs by run ID, ships only the events that carry its own run ID to Discord, and follows a renamed conversation with the stored session ID, so the next message continues the same session. Hosts without stable run IDs keep working through the conversation ID and the event timestamps.
 
 ## Development
 

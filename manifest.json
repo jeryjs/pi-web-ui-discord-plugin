@@ -3,7 +3,7 @@
   "id": "discord",
   "name": "discord",
   "nameEn": "Discord",
-  "version": "1.7.0",
+  "version": "1.8.0",
   "description": "Native Discord Gateway bot for pi-web-ui with user-installable and guild slash commands, per-scope persistent sessions, thinking and core-prompt controls, workspace session reuse, reply context, a live typing indicator, live tool traces, streamed replies, attachments, and encrypted credentials.",
   "descriptionEn": "Native Discord Gateway bot for pi-web-ui with user-installable and guild slash commands, per-scope persistent sessions, thinking and core-prompt controls, workspace session reuse, reply context, a live typing indicator, live tool traces, streamed replies, attachments, and encrypted credentials.",
   "author": "jeryjs",

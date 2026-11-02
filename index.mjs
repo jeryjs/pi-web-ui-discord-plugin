@@ -1024,6 +1024,8 @@ export class DiscordBotBridge {
 
 		this.pendingRuns = new Map();
 		this.earlyRuns = new Map();
+		/** Stable host run id -> pendingRuns key: a transferred turn stays ours. */
+		this.runIdIndex = new Map();
 		this.runErrors = new Map();
 		this.userConversations = new Map();
 		this.userWorkspaces = new Map(Object.entries(initialUserWorkspaces || {}));
@@ -1276,6 +1278,7 @@ export class DiscordBotBridge {
 			} catch {}
 			this.offRunEvent = null;
 		}
+		this.runIdIndex.clear();
 	}
 
 	async connectGateway() {
@@ -2433,6 +2436,7 @@ export class DiscordBotBridge {
 			finished: false,
 			delivered: false,
 			conversationId: "",
+			hostRunId: "",
 			stopReason: "",
 			lastError: "",
 			resolveCompletion: null,
@@ -2636,6 +2640,7 @@ export class DiscordBotBridge {
 			this.startTypingIndicator(run, this.getConfig());
 			const dispatched = await this.host.chat(request);
 			const conversationId = String(dispatched?.conversationId || "").trim();
+			const hostRunId = String(dispatched?.runId || "").trim();
 			run.clientId = String(dispatched?.clientId || "").trim();
 			const expectedClientId = `plugin:discord:${request.accountId}`;
 			if (
@@ -2649,9 +2654,13 @@ export class DiscordBotBridge {
 			}
 			if (!conversationId) throw new Error("pi-web-ui did not return a conversation ID");
 
-			run.conversationId = conversationId;
+			run.hostRunId = hostRunId;
+			this.adoptConversationId(run, conversationId);
 			await this.rememberUserSession(run.sessionKey, conversationId);
-			if (!run.finished) this.pendingRuns.set(conversationId, run);
+			if (!run.finished) {
+				this.pendingRuns.set(conversationId, run);
+				this.rememberRunId(conversationId, hostRunId);
+			}
 
 			const early = this.earlyRuns.get(conversationId);
 			if (early?.accumulatedText && !run.accumulatedText) {
@@ -2664,7 +2673,7 @@ export class DiscordBotBridge {
 
 			await run.completion;
 		} catch (error) {
-			this.pendingRuns.delete(run.conversationId);
+			this.forgetRun(run);
 			this.stopTypingIndicator(run);
 			const config = this.getConfig();
 			await this.api(config.botToken, "POST", `/channels/${run.channelId}/messages`, {
@@ -2683,18 +2692,24 @@ export class DiscordBotBridge {
 
 	async handleRunEvent(event) {
 		const conversationId = String(event?.conversationId || "").trim();
-		if (!conversationId) return;
+		const eventRunId = String(event?.runId || "").trim();
+		if (!conversationId && !eventRunId) return;
 		const eventAt = Number(event?.at || 0);
 
 		if (event.type === "run_start") {
-			const run = this.findRun(conversationId);
+			const run = this.findRunForEvent(event);
+			// A stamped event with another run id belongs to a different turn.
+			if (run && !this.eventBelongsToRun(run, event)) return;
+			if (run) this.adoptConversationId(run, conversationId);
 			if (run && !this.isStaleRunEvent(run, eventAt)) this.openRunTurn(run);
 			return;
 		}
 
 		if (event.type === "message" && event.message) {
 			const role = String(event.message.role || event.message.author || "").trim();
-			let run = this.findRun(conversationId);
+			let run = this.findRunForEvent(event);
+			if (run && !this.eventBelongsToRun(run, event)) return;
+			if (run) this.adoptConversationId(run, conversationId);
 			// Shared conversations also carry the browser's own turns: ignore
 			// events emitted before this Discord turn was dispatched.
 			if (run && this.isStaleRunEvent(run, eventAt)) return;
@@ -2729,7 +2744,9 @@ export class DiscordBotBridge {
 		}
 
 		if (event.type !== "run_end") return;
-		let run = this.findRun(conversationId);
+		let run = this.findRunForEvent(event);
+		if (run && !this.eventBelongsToRun(run, event)) return;
+		if (run) this.adoptConversationId(run, conversationId);
 		if (!run) {
 			this.earlyRuns.delete(conversationId);
 			this.runErrors.delete(conversationId);
@@ -2769,6 +2786,88 @@ export class DiscordBotBridge {
 		return null;
 	}
 
+	/**
+	 * Find the run that owns an event.
+	 *
+	 * pi-web-ui stamps every event of a plugin-driven turn with a stable run
+	 * id. The conversation id alone is not enough: the host moves or renames
+	 * the conversation when it hands a turn to another client session, and the
+	 * run id stays the same.
+	 */
+	findRunForEvent(event) {
+		const runId = String(event?.runId || "").trim();
+		if (runId) {
+			const key = this.runIdIndex.get(runId);
+			const run = key ? this.pendingRuns.get(key) : null;
+			if (run) return run;
+		}
+		return this.findRun(String(event?.conversationId || "").trim());
+	}
+
+	/**
+	 * Whether an event belongs to the turn this run dispatched.
+	 *
+	 * Only a known mismatch rejects an event: a host without stable run ids
+	 * keeps working through the timestamp check.
+	 */
+	eventBelongsToRun(run, event) {
+		const eventRunId = String(event?.runId || "").trim();
+		const runId = String(run?.hostRunId || "").trim();
+		if (!eventRunId || !runId) return true;
+		return eventRunId === runId;
+	}
+
+	/** Remember the stable host run id of a dispatched turn. */
+	rememberRunId(conversationId, runId) {
+		const id = String(runId || "").trim();
+		if (!id || !conversationId) return;
+		this.runIdIndex.set(id, conversationId);
+	}
+
+	/**
+	 * Adopt the conversation id the host assigned after a transfer or rename.
+	 *
+	 * The turn keeps its identity through the run id, so the pending run and
+	 * the remembered session follow the new id.
+	 */
+	adoptConversationId(run, conversationId) {
+		const id = String(conversationId || "").trim();
+		if (!run || !id || run.conversationId === id) return;
+		const previous = run.conversationId;
+		if (this.pendingRuns.get(previous) === run) this.pendingRuns.delete(previous);
+		const early = this.earlyRuns.get(previous);
+		if (early) {
+			this.earlyRuns.delete(previous);
+			this.earlyRuns.set(id, early);
+		}
+		const error = this.runErrors.get(previous);
+		if (error) {
+			this.runErrors.delete(previous);
+			this.runErrors.set(id, error);
+		}
+		run.conversationId = id;
+		if (!run.finished) this.pendingRuns.set(id, run);
+		if (run.hostRunId) this.runIdIndex.set(run.hostRunId, id);
+		// The remembered session has to point at the conversation that exists now.
+		if (this.userSessions.get(run.sessionKey)?.conversationId === previous) {
+			void this.rememberUserSession(run.sessionKey, id);
+		}
+		if (previous) {
+			this.log("debug", `Discord conversation moved from ${previous} to ${id}; the run id keeps the turn.`);
+		}
+	}
+
+	/** Drop the pending run and every run id mapping that belongs to it. */
+	forgetRun(run) {
+		if (!run) return;
+		for (const [key, candidate] of this.pendingRuns) {
+			if (candidate === run) this.pendingRuns.delete(key);
+		}
+		for (const [runId, key] of this.runIdIndex) {
+			if (key === run.conversationId || !this.pendingRuns.has(key)) this.runIdIndex.delete(runId);
+		}
+	}
+
 	/** Whether a run event predates this Discord turn and must be ignored. */
 	isStaleRunEvent(run, eventAt) {
 		if (!run || !eventAt) return false;
@@ -2801,7 +2900,7 @@ export class DiscordBotBridge {
 		this.clearRunSettle(run);
 		// The answer is on its way: the typing indicator is not needed anymore.
 		this.stopTypingIndicator(run);
-		if (run.conversationId) this.pendingRuns.delete(run.conversationId);
+		this.forgetRun(run);
 		this.earlyRuns.delete(run.conversationId);
 
 		const generation = Number(this.userGenerations.get(run.authorId) || 0);
